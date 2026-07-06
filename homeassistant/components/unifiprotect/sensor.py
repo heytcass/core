@@ -649,6 +649,8 @@ def _async_event_entities(
 def _async_nvr_entities(
     data: ProtectData,
 ) -> list[BaseProtectEntity]:
+    if data.api.is_public_only:
+        return []
     entities: list[BaseProtectEntity] = []
     device = data.api.bootstrap.nvr
     for description in NVR_SENSORS + NVR_DISABLED_SENSORS:

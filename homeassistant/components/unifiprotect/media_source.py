@@ -82,11 +82,14 @@ EVENT_NAME_MAP = {
 
 async def async_get_media_source(hass: HomeAssistant) -> MediaSource:
     """Set up UniFi Protect media source."""
+    # Media browsing requires the private API, which is unavailable for
+    # entries that authenticate with an API key only.
     return ProtectMediaSource(
         hass,
         {
             entry.runtime_data.api.bootstrap.nvr.id: entry.runtime_data
             for entry in async_get_ufp_entries(hass)
+            if not entry.runtime_data.api.is_public_only
         },
     )
 

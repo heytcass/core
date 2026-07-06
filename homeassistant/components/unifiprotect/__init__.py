@@ -15,7 +15,7 @@ from uiprotect.test_util.anonymize import anonymize_data  # noqa: F401
 
 from homeassistant.config_entries import ConfigEntryState
 from homeassistant.const import CONF_API_KEY, EVENT_HOMEASSISTANT_STOP
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import (
     ConfigEntryAuthFailed,
     ConfigEntryError,
@@ -78,6 +78,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: UFPConfigEntry) -> bool:
     else:
         data_service = ProtectData(hass, protect, SCAN_INTERVAL, entry)
         entry.runtime_data = data_service
+
+    if protect.is_public_only:
+        return await _async_setup_public_only_entry(hass, entry, data_service)
 
     try:
         await protect.update()
@@ -150,6 +153,86 @@ async def async_setup_entry(hass: HomeAssistant, entry: UFPConfigEntry) -> bool:
     return True
 
 
+async def _async_setup_public_only_entry(
+    hass: HomeAssistant,
+    entry: UFPConfigEntry,
+    data_service: ProtectData,
+) -> bool:
+    """Set up a config entry that authenticates with an API key only.
+
+    Consoles managed through UniFi Fabric with centralized people management
+    no longer offer local users, so the private (session based) API is
+    unavailable and only the public integration API can be used. Feature
+    coverage is limited to what that API exposes.
+    """
+    protect = data_service.api
+    try:
+        meta_info = await protect.get_meta_info()
+    except NotAuthorized as err:
+        data_service.auth_retries += 1
+        if data_service.auth_retries > AUTH_RETRIES:
+            raise ConfigEntryAuthFailed(
+                translation_domain=DOMAIN,
+                translation_key="entry_auth_failed",
+            ) from err
+        raise ConfigEntryNotReady from err
+    except (TimeoutError, ClientError, ServerDisconnectedError) as err:
+        raise ConfigEntryNotReady from err
+
+    if meta_info.version < MIN_REQUIRED_PROTECT_V:
+        raise ConfigEntryError(
+            translation_domain=DOMAIN,
+            translation_key="protect_version",
+            translation_placeholders={
+                "current_version": str(meta_info.version),
+                "min_version": str(MIN_REQUIRED_PROTECT_V),
+            },
+        )
+
+    entry.async_on_unload(
+        hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, data_service.async_stop)
+    )
+
+    # Subscribe to the public websockets first, then prime the cache
+    # (per library docs), so no updates are missed in between.
+    data_service.async_setup()
+    try:
+        await protect.update_public()
+    except NotAuthorized as err:
+        await data_service.async_stop()
+        raise ConfigEntryAuthFailed(
+            translation_domain=DOMAIN,
+            translation_key="entry_auth_failed",
+        ) from err
+    except (TimeoutError, ClientError, ServerDisconnectedError) as err:
+        await data_service.async_stop()
+        raise ConfigEntryNotReady from err
+
+    # update_public() fetches each endpoint best-effort; the NVR endpoint
+    # must have succeeded for the entry to be usable.
+    if (nvr := protect.public_bootstrap.nvr) is None:
+        await data_service.async_stop()
+        _LOGGER.debug("NVR data unavailable from public API")
+        raise ConfigEntryNotReady
+
+    if entry.unique_id is None:
+        hass.config_entries.async_update_entry(entry, unique_id=nvr.id)
+
+    device_registry = dr.async_get(hass)
+    device_registry.async_get_or_create(
+        config_entry_id=entry.entry_id,
+        identifiers={(DOMAIN, nvr.id)},
+        manufacturer="Ubiquiti",
+        name=nvr.name or entry.title,
+        sw_version=str(meta_info.version),
+        configuration_url=protect.base_url,
+    )
+
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+    _async_register_views(hass)
+    return True
+
+
 async def _async_setup_entry(
     hass: HomeAssistant,
     entry: UFPConfigEntry,
@@ -185,6 +268,11 @@ async def _async_setup_entry(
     )
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+    _async_register_views(hass)
+
+
+@callback
+def _async_register_views(hass: HomeAssistant) -> None:
     hass.http.register_view(ThumbnailProxyView(hass))
     hass.http.register_view(SnapshotProxyView(hass))
     hass.http.register_view(VideoProxyView(hass))
@@ -225,7 +313,23 @@ async def async_remove_config_entry_device(
         for connection in device_entry.connections
         if connection[0] == dr.CONNECTION_NETWORK_MAC
     }
-    api = config_entry.runtime_data.api
+    data = config_entry.runtime_data
+    api = data.api
+    if api.is_public_only:
+        # The public API exposes no NVR MAC, so the NVR device is matched by
+        # its registry identifier instead.
+        if (identifier := data.nvr_device_identifier) is not None and (
+            identifier in device_entry.identifiers
+        ):
+            return False
+        if api.has_public_bootstrap:
+            public_bootstrap = api.public_bootstrap
+            public_device_macs = {
+                relay.mac for relay in public_bootstrap.relays.values()
+            } | {siren.mac for siren in public_bootstrap.sirens.values()}
+            if unifi_macs & public_device_macs:
+                return False
+        return True
     if api.bootstrap.nvr.mac in unifi_macs:
         return False
     for device in async_get_devices(api.bootstrap, DEVICES_THAT_ADOPT):

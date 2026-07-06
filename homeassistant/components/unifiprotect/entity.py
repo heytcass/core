@@ -58,6 +58,11 @@ def _async_device_entities(
     if not descs and not unadopted_descs:
         return []
 
+    # Devices and the auth user only exist in the private bootstrap, which is
+    # unavailable when authenticating with an API key only.
+    if data.api.is_public_only:
+        return []
+
     entities: list[BaseProtectEntity] = []
     devices = (
         [ufp_device]

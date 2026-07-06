@@ -6,7 +6,8 @@ from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 from uiprotect import NotAuthorized, NvrError, ProtectApiClient
-from uiprotect.data import NVR, Bootstrap, CloudAccount, Version
+from uiprotect.data import NVR, Bootstrap, CloudAccount, PublicNVR, Version
+from uiprotect.data.nvr import MetaInfo
 from uiprotect.exceptions import ClientError
 
 from homeassistant import config_entries
@@ -147,6 +148,155 @@ async def test_user_flow(hass: HomeAssistant, bootstrap: Bootstrap, nvr: NVR) ->
     assert result["result"].unique_id == _async_unifi_mac_from_hass(nvr.mac)
     assert len(mock_setup_entry.mock_calls) == 1
     assert len(mock_setup.mock_calls) == 1
+
+
+async def test_user_flow_api_key_only(
+    hass: HomeAssistant, public_nvr: PublicNVR, mock_setup: None
+) -> None:
+    """Test user flow with only an API key creates a public-only entry."""
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": config_entries.SOURCE_USER}
+    )
+    assert result["type"] is FlowResultType.FORM
+    assert not result["errors"]
+
+    with (
+        patch(
+            "homeassistant.components.unifiprotect.config_flow.ProtectApiClient.get_meta_info",
+            return_value=MetaInfo(applicationVersion="6.0.0"),
+        ),
+        patch(
+            "homeassistant.components.unifiprotect.config_flow.ProtectApiClient.get_nvr_public",
+            return_value=public_nvr,
+        ),
+    ):
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            {
+                "host": DEFAULT_HOST,
+                "api_key": DEFAULT_API_KEY,
+            },
+        )
+        await hass.async_block_till_done()
+
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert result["title"] == "Test NVR"
+    assert result["data"] == {
+        "host": DEFAULT_HOST,
+        "api_key": DEFAULT_API_KEY,
+        "id": "Test NVR",
+        "port": 443,
+        "verify_ssl": False,
+    }
+    assert result["result"].unique_id == public_nvr.id
+
+
+@pytest.mark.parametrize(
+    ("credentials"),
+    [
+        pytest.param({}, id="no_credentials"),
+        pytest.param({"username": DEFAULT_USERNAME}, id="username_only"),
+        pytest.param({"password": DEFAULT_PASSWORD}, id="password_only"),
+        pytest.param(
+            {"username": DEFAULT_USERNAME, "api_key": DEFAULT_API_KEY},
+            id="username_and_api_key_without_password",
+        ),
+    ],
+)
+async def test_user_flow_missing_auth_method(
+    hass: HomeAssistant, credentials: dict[str, str]
+) -> None:
+    """Test user flow errors when no complete authentication method is given."""
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": config_entries.SOURCE_USER}
+    )
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {
+            "host": DEFAULT_HOST,
+            **credentials,
+        },
+    )
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["errors"] == {"base": "auth_method_required"}
+
+
+async def test_user_flow_api_key_only_invalid_auth(
+    hass: HomeAssistant, public_nvr: PublicNVR, mock_setup: None
+) -> None:
+    """Test user flow with an invalid API key and recovery."""
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": config_entries.SOURCE_USER}
+    )
+
+    with patch(
+        "homeassistant.components.unifiprotect.config_flow.ProtectApiClient.get_meta_info",
+        side_effect=NotAuthorized,
+    ):
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            {
+                "host": DEFAULT_HOST,
+                "api_key": "invalid-api-key",
+            },
+        )
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["errors"] == {"api_key": "invalid_auth"}
+
+    # Now test recovery with a valid API key
+    with (
+        patch(
+            "homeassistant.components.unifiprotect.config_flow.ProtectApiClient.get_meta_info",
+            return_value=MetaInfo(applicationVersion="6.0.0"),
+        ),
+        patch(
+            "homeassistant.components.unifiprotect.config_flow.ProtectApiClient.get_nvr_public",
+            return_value=public_nvr,
+        ),
+    ):
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            {
+                "host": DEFAULT_HOST,
+                "api_key": DEFAULT_API_KEY,
+            },
+        )
+
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert result["result"].unique_id == public_nvr.id
+
+
+async def test_user_flow_api_key_only_version_too_old(
+    hass: HomeAssistant, public_nvr: PublicNVR
+) -> None:
+    """Test user flow with only an API key on outdated firmware."""
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": config_entries.SOURCE_USER}
+    )
+
+    with (
+        patch(
+            "homeassistant.components.unifiprotect.config_flow.ProtectApiClient.get_meta_info",
+            return_value=MetaInfo(applicationVersion="5.3.0"),
+        ),
+        patch(
+            "homeassistant.components.unifiprotect.config_flow.ProtectApiClient.get_nvr_public",
+            return_value=public_nvr,
+        ),
+    ):
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            {
+                "host": DEFAULT_HOST,
+                "api_key": DEFAULT_API_KEY,
+            },
+        )
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["errors"] == {"base": "protect_version"}
 
 
 async def test_form_version_too_old(

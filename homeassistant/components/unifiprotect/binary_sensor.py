@@ -727,6 +727,8 @@ def _async_event_entities(
 def _async_nvr_entities(
     data: ProtectData,
 ) -> list[BaseProtectEntity]:
+    if data.api.is_public_only:
+        return []
     device = data.api.bootstrap.nvr
     if (ustorage := device.system_info.ustorage) is None:
         return []

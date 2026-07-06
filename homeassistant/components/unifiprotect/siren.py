@@ -68,15 +68,15 @@ class ProtectSiren(SirenEntity):
         self.data = data
         self._siren_id = siren.id
         self._attr_unique_id = f"{siren.mac}_siren"
-        nvr = data.api.bootstrap.nvr
         self._attr_device_info = DeviceInfo(
             connections={(dr.CONNECTION_NETWORK_MAC, siren.mac)},
             identifiers={(DOMAIN, siren.mac)},
             manufacturer=DEFAULT_BRAND,
             name=siren.name,
             model="Siren",
-            via_device=(DOMAIN, nvr.mac),
         )
+        if (via_device := data.nvr_device_identifier) is not None:
+            self._attr_device_info["via_device"] = via_device
         self._siren_mac = siren.mac
         self._cancel_scheduled_off: CALLBACK_TYPE | None = None
         self._update_from_siren(siren)

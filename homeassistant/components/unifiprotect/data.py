@@ -89,6 +89,7 @@ class ProtectData:
         self._siren_subscriptions: defaultdict[str, set[Callable[[Siren], None]]] = (
             defaultdict(set)
         )
+        self._public_nvr_subscriptions: set[Callable[[], None]] = set()
         self._pending_camera_ids: set[str] = set()
         self._unsubs: list[CALLBACK_TYPE] = []
         self._auth_failures = 0
@@ -105,6 +106,30 @@ class ProtectData:
     def disable_stream(self) -> bool:
         """Check if RTSP is disabled."""
         return self._entry.options.get(CONF_DISABLE_RTSP, False)  # type: ignore[no-any-return]
+
+    @property
+    def nvr_id(self) -> str | None:
+        """Return the NVR id in both private and public-only auth modes."""
+        api = self.api
+        if api.is_public_only:
+            if api.has_public_bootstrap and api.public_bootstrap.nvr is not None:
+                return api.public_bootstrap.nvr.id
+            return None
+        return api.bootstrap.nvr.id
+
+    @property
+    def nvr_device_identifier(self) -> tuple[str, str] | None:
+        """Return the registry identifier of the NVR device.
+
+        The private API exposes the NVR MAC, the public API only a stable id,
+        so the two auth modes use different identifier values.
+        """
+        api = self.api
+        if not api.is_public_only:
+            return (DOMAIN, api.bootstrap.nvr.mac)
+        if (nvr_id := self.nvr_id) is not None:
+            return (DOMAIN, nvr_id)
+        return None
 
     @property
     def max_events(self) -> int:
@@ -124,6 +149,10 @@ class ProtectData:
         self, device_types: Iterable[ModelType], ignore_unadopted: bool = True
     ) -> Generator[ProtectAdoptableDeviceModel]:
         """Get all devices matching types."""
+        # Devices from the private bootstrap do not exist in public-only
+        # (API-key-only) mode; entities for them are handled per platform.
+        if self.api.is_public_only:
+            return
         bootstrap = self.api.bootstrap
         for device_type in device_types:
             for device in async_get_devices_by_type(bootstrap, device_type).values():
@@ -165,8 +194,6 @@ class ProtectData:
         self._async_update_change(True, force_update=True)
         api = self.api
         self._unsubs = [
-            api.subscribe_websocket_state(self._async_websocket_state_changed),
-            api.subscribe_websocket(self._async_process_ws_message),
             async_track_time_interval(
                 self._hass, self._async_poll, self._update_interval
             ),
@@ -177,6 +204,19 @@ class ProtectData:
                 self._async_process_public_devices_ws_message
             ),
         ]
+        if api.is_public_only:
+            self._unsubs.append(
+                api.subscribe_devices_websocket_state(
+                    self._async_websocket_state_changed
+                )
+            )
+        else:
+            self._unsubs.extend(
+                (
+                    api.subscribe_websocket_state(self._async_websocket_state_changed),
+                    api.subscribe_websocket(self._async_process_ws_message),
+                )
+            )
 
     @callback
     def _async_process_public_devices_ws_message(
@@ -199,7 +239,10 @@ class ProtectData:
                 self._async_signal_siren_update(cast(Siren, old_obj))
             return
         if new_obj.model is ModelType.NVR:
-            self._async_signal_device_update(self.api.bootstrap.nvr)
+            if self.api.is_public_only:
+                self._async_signal_public_nvr_update()
+            else:
+                self._async_signal_device_update(self.api.bootstrap.nvr)
             return
         if new_obj.model is ModelType.RELAY:
             relay = cast(Relay, new_obj)
@@ -250,8 +293,12 @@ class ProtectData:
 
     async def async_refresh(self) -> None:
         """Update the data."""
+        api = self.api
         try:
-            await self.api.update()
+            if api.is_public_only:
+                await api.update_public()
+            else:
+                await api.update()
         except NotAuthorized as ex:
             if self._auth_failures < AUTH_RETRIES:
                 _LOGGER.exception("Auth error while updating")
@@ -381,7 +428,10 @@ class ProtectData:
     @callback
     def _async_process_updates(self) -> None:
         """Process update from the protect data."""
-        self._async_signal_device_update(self.api.bootstrap.nvr)
+        if self.api.is_public_only:
+            self._async_signal_public_nvr_update()
+        else:
+            self._async_signal_device_update(self.api.bootstrap.nvr)
         for device in self.get_by_types(DEVICES_THAT_ADOPT):
             self._async_signal_device_update(device)
         if self.api.has_public_bootstrap:
@@ -435,6 +485,20 @@ class ProtectData:
         self._relay_subscriptions[mac].remove(update_callback)
         if not self._relay_subscriptions[mac]:
             del self._relay_subscriptions[mac]
+
+    @callback
+    def async_subscribe_public_nvr(
+        self, update_callback: Callable[[], None]
+    ) -> CALLBACK_TYPE:
+        """Add a callback subscriber for public-API NVR updates."""
+        self._public_nvr_subscriptions.add(update_callback)
+        return partial(self._public_nvr_subscriptions.discard, update_callback)
+
+    @callback
+    def _async_signal_public_nvr_update(self) -> None:
+        """Call the callbacks subscribed to public-API NVR updates."""
+        for update_callback in self._public_nvr_subscriptions:
+            update_callback()
 
     @callback
     def async_subscribe_siren(
@@ -513,7 +577,7 @@ def async_get_data_for_nvr_id(hass: HomeAssistant, nvr_id: str) -> ProtectData |
         iter(
             entry.runtime_data
             for entry in async_get_ufp_entries(hass)
-            if entry.runtime_data.api.bootstrap.nvr.id == nvr_id
+            if entry.runtime_data.nvr_id == nvr_id
         ),
         None,
     )

@@ -7,7 +7,7 @@ from typing import Any
 
 from aiohttp import CookieJar
 from uiprotect import ProtectApiClient
-from uiprotect.data import NVR
+from uiprotect.data import NVR, PublicNVR
 from uiprotect.exceptions import ClientError, NotAuthorized
 from unifi_discovery import async_console_is_alive
 import voluptuous as vol
@@ -78,7 +78,7 @@ def _build_data_without_credentials(entry_data: Mapping[str, Any]) -> dict[str, 
         CONF_HOST: entry_data[CONF_HOST],
         CONF_PORT: entry_data[CONF_PORT],
         CONF_VERIFY_SSL: entry_data[CONF_VERIFY_SSL],
-        CONF_USERNAME: entry_data[CONF_USERNAME],
+        CONF_USERNAME: entry_data.get(CONF_USERNAME, ""),
     }
 
 
@@ -122,18 +122,21 @@ def _build_schema(
     *,
     include_host: bool = True,
     include_connection: bool = True,
-    credentials_optional: bool = False,
 ) -> vol.Schema:
     """Build a config flow schema.
+
+    Credentials are always optional at the schema level: either a username
+    and password, or an API key (or both) must be provided, which is
+    validated when the form is submitted. Consoles managed through UniFi
+    Fabric with centralized people management offer no local users, so an
+    API key is the only possible authentication method there.
 
     Args:
         include_host: Include host field (False when host comes from discovery).
         include_connection: Include port/verify_ssl fields.
-        credentials_optional: Credentials optional (True to keep existing values).
 
     """
     req, opt = vol.Required, vol.Optional
-    cred_key = opt if credentials_optional else req
 
     schema: dict[vol.Marker, selector.Selector] = {}
     if include_host:
@@ -141,23 +144,29 @@ def _build_schema(
     if include_connection:
         schema[req(CONF_PORT, default=DEFAULT_PORT)] = _PORT_SELECTOR
         schema[req(CONF_VERIFY_SSL, default=DEFAULT_VERIFY_SSL)] = _BOOL_SELECTOR
-    schema[req(CONF_USERNAME)] = _TEXT_SELECTOR
-    schema[cred_key(CONF_PASSWORD)] = _PASSWORD_SELECTOR
-    schema[cred_key(CONF_API_KEY)] = _PASSWORD_SELECTOR
+    schema[opt(CONF_USERNAME)] = _TEXT_SELECTOR
+    schema[opt(CONF_PASSWORD)] = _PASSWORD_SELECTOR
+    schema[opt(CONF_API_KEY)] = _PASSWORD_SELECTOR
     return vol.Schema(schema)
 
 
 # Schemas for different flow contexts
-# User flow: all fields required
+# User flow: all fields shown
 CONFIG_SCHEMA = _build_schema()
 # Reconfigure flow: keep existing credentials if not provided
-RECONFIGURE_SCHEMA = _build_schema(credentials_optional=True)
+RECONFIGURE_SCHEMA = _build_schema()
 # Discovery flow: host comes from discovery, user sets port/ssl
 DISCOVERY_SCHEMA = _build_schema(include_host=False)
 # Reauth flow: only credentials, connection settings preserved
-REAUTH_SCHEMA = _build_schema(
-    include_host=False, include_connection=False, credentials_optional=True
-)
+REAUTH_SCHEMA = _build_schema(include_host=False, include_connection=False)
+
+
+@callback
+def _console_title(nvr_data: NVR | PublicNVR) -> str:
+    """Return the entry title for a validated console."""
+    if isinstance(nvr_data, NVR):
+        return nvr_data.display_name
+    return nvr_data.name or "UniFi Protect"
 
 
 async def async_local_user_documentation_url(hass: HomeAssistant) -> str:
@@ -273,7 +282,7 @@ class ProtectFlowHandler(ConfigFlow, domain=DOMAIN):
                 merged_input[CONF_VERIFY_SSL] = False
                 nvr_data, errors = await self._async_get_nvr_data(merged_input)
             if nvr_data and not errors:
-                return self._async_create_entry(nvr_data.display_name, merged_input)
+                return self._async_create_entry(_console_title(nvr_data), merged_input)
             # Preserve user input for form re-display, but keep discovery info
             form_data = {
                 CONF_HOST: merged_input[CONF_HOST],
@@ -330,7 +339,17 @@ class ProtectFlowHandler(ConfigFlow, domain=DOMAIN):
     async def _async_get_nvr_data(
         self,
         user_input: dict[str, Any],
-    ) -> tuple[NVR | None, dict[str, str]]:
+    ) -> tuple[NVR | PublicNVR | None, dict[str, str]]:
+        username = user_input.get(CONF_USERNAME) or None
+        password = user_input.get(CONF_PASSWORD) or None
+        api_key = user_input.get(CONF_API_KEY) or None
+
+        # Either a username and password, or an API key, must be provided.
+        # Only an API key works on consoles managed through UniFi Fabric with
+        # centralized people management, which offer no local users.
+        if bool(username) != bool(password) or not (username or api_key):
+            return None, {"base": "auth_method_required"}
+
         session = async_create_clientsession(
             self.hass, cookie_jar=CookieJar(unsafe=True)
         )
@@ -345,13 +364,16 @@ class ProtectFlowHandler(ConfigFlow, domain=DOMAIN):
             public_api_session=public_api_session,
             host=host,
             port=port,
-            username=user_input[CONF_USERNAME],
-            password=user_input[CONF_PASSWORD],
-            api_key=user_input.get(CONF_API_KEY, ""),
+            username=username,
+            password=password,
+            api_key=api_key,
             verify_ssl=verify_ssl,
             cache_dir=Path(self.hass.config.path(STORAGE_DIR, "unifiprotect")),
             config_dir=Path(self.hass.config.path(STORAGE_DIR, "unifiprotect")),
         )
+
+        if protect.is_public_only:
+            return await self._async_get_public_nvr_data(protect)
 
         errors = {}
         nvr_data = None
@@ -388,6 +410,32 @@ class ProtectFlowHandler(ConfigFlow, domain=DOMAIN):
                 _LOGGER.error(ex)
                 errors["base"] = "cannot_connect"
 
+        return nvr_data, errors
+
+    async def _async_get_public_nvr_data(
+        self,
+        protect: ProtectApiClient,
+    ) -> tuple[PublicNVR | None, dict[str, str]]:
+        """Validate an API-key-only console via the public integration API."""
+        errors: dict[str, str] = {}
+        nvr_data = None
+        try:
+            meta_info = await protect.get_meta_info()
+            nvr_data = await protect.get_nvr_public()
+        except NotAuthorized as ex:
+            _LOGGER.debug(ex)
+            errors[CONF_API_KEY] = "invalid_auth"
+        except ClientError as ex:
+            _LOGGER.error(ex)
+            errors["base"] = "cannot_connect"
+        else:
+            if meta_info.version < MIN_REQUIRED_PROTECT_V:
+                _LOGGER.debug(
+                    OUTDATED_LOG_MESSAGE,
+                    meta_info.version,
+                    MIN_REQUIRED_PROTECT_V,
+                )
+                errors["base"] = "protect_version"
         return nvr_data, errors
 
     async def async_step_reauth(
@@ -463,15 +511,26 @@ class ProtectFlowHandler(ConfigFlow, domain=DOMAIN):
             # validate login data
             nvr_data, errors = await self._async_get_nvr_data(merged_input)
             if nvr_data and not errors:
-                new_unique_id = _async_unifi_mac_from_hass(nvr_data.mac)
-                _LOGGER.debug(
-                    "Reconfigure: Current unique_id=%s, NVR MAC=%s, formatted=%s",
-                    reconfigure_entry.unique_id,
-                    nvr_data.mac,
-                    new_unique_id,
-                )
-                await self.async_set_unique_id(new_unique_id)
-                self._abort_if_unique_id_mismatch(reason="wrong_nvr")
+                if isinstance(nvr_data, NVR):
+                    new_unique_id = _async_unifi_mac_from_hass(nvr_data.mac)
+                    _LOGGER.debug(
+                        "Reconfigure: Current unique_id=%s, NVR MAC=%s, formatted=%s",
+                        reconfigure_entry.unique_id,
+                        nvr_data.mac,
+                        new_unique_id,
+                    )
+                    await self.async_set_unique_id(new_unique_id)
+                    self._abort_if_unique_id_mismatch(reason="wrong_nvr")
+                elif reconfigure_entry.unique_id != nvr_data.id:
+                    # API-key-only entries store the NVR id as unique id;
+                    # a MAC based unique id cannot be verified through the
+                    # public API, which exposes no NVR MAC.
+                    _LOGGER.debug(
+                        "Reconfigure: cannot verify NVR identity via public API"
+                        " (unique_id=%s, NVR id=%s)",
+                        reconfigure_entry.unique_id,
+                        nvr_data.id,
+                    )
 
                 return self.async_update_reload_and_abort(
                     reconfigure_entry,
@@ -501,10 +560,13 @@ class ProtectFlowHandler(ConfigFlow, domain=DOMAIN):
             nvr_data, errors = await self._async_get_nvr_data(user_input)
 
             if nvr_data and not errors:
-                await self.async_set_unique_id(nvr_data.mac)
+                # The public API does not expose the NVR MAC, so API-key-only
+                # entries use the stable NVR id as unique id instead.
+                unique_id = nvr_data.mac if isinstance(nvr_data, NVR) else nvr_data.id
+                await self.async_set_unique_id(unique_id)
                 self._abort_if_unique_id_configured()
 
-                return self._async_create_entry(nvr_data.display_name, user_input)
+                return self._async_create_entry(_console_title(nvr_data), user_input)
 
         return self.async_show_form(
             step_id="user",

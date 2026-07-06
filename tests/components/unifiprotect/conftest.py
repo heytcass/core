@@ -21,12 +21,15 @@ from uiprotect.data import (
     Doorlock,
     Light,
     Liveview,
+    PublicBootstrap,
+    PublicNVR,
     Sensor,
     SmartDetectObjectType,
     VideoMode,
     Viewer,
     WSSubscriptionMessage,
 )
+from uiprotect.data.nvr import MetaInfo
 from uiprotect.websocket import WebsocketState
 
 from homeassistant.components.unifiprotect.const import DOMAIN
@@ -100,6 +103,81 @@ def mock_ufp_config_entry():
     )
 
 
+@pytest.fixture(name="ufp_api_key_config_entry")
+def mock_ufp_api_key_config_entry():
+    """Mock a config entry that authenticates with an API key only."""
+
+    return MockConfigEntry(
+        domain=DOMAIN,
+        data={
+            CONF_HOST: DEFAULT_HOST,
+            CONF_API_KEY: DEFAULT_API_KEY,
+            "id": "UnifiProtect",
+            CONF_PORT: DEFAULT_PORT,
+            CONF_VERIFY_SSL: DEFAULT_VERIFY_SSL,
+        },
+        version=2,
+        unique_id="test_nvr_id",
+    )
+
+
+@pytest.fixture(name="public_nvr")
+def mock_public_nvr():
+    """Mock a public API NVR."""
+    return PublicNVR(id="test_nvr_id", name="Test NVR")
+
+
+@pytest.fixture(name="ufp_public_client")
+def mock_ufp_public_client(public_nvr: PublicNVR):
+    """Mock a public-only (API-key-only) ProtectApiClient."""
+    client = Mock()
+    client.is_public_only = True
+    client.has_public_bootstrap = True
+    client.base_url = "https://127.0.0.1"
+
+    public_bootstrap = Mock(spec=PublicBootstrap)
+    public_bootstrap.nvr = public_nvr
+    public_bootstrap.arm_mode = None
+    public_bootstrap.arm_profiles = {}
+    public_bootstrap.relays = {}
+    public_bootstrap.sirens = {}
+    client.public_bootstrap = public_bootstrap
+
+    client.get_meta_info = AsyncMock(return_value=MetaInfo(applicationVersion="6.0.0"))
+    client.update_public = AsyncMock(return_value=public_bootstrap)
+    client.async_disconnect_ws = AsyncMock()
+    client.clear_session = AsyncMock()
+    return client
+
+
+@pytest.fixture(name="ufp_public")
+def mock_public_entry(
+    hass: HomeAssistant,
+    ufp_api_key_config_entry: MockConfigEntry,
+    ufp_public_client: ProtectApiClient,
+):
+    """Mock a public-only (API-key-only) config entry with client."""
+
+    with patch(
+        "homeassistant.components.unifiprotect.utils.ProtectApiClient"
+    ) as mock_api:
+        ufp_api_key_config_entry.add_to_hass(hass)
+
+        mock_api.return_value = ufp_public_client
+
+        ufp = MockUFPFixture(ufp_api_key_config_entry, ufp_public_client)
+
+        def subscribe_devices_websocket(
+            ws_callback: Callable[[WSSubscriptionMessage], None],
+        ) -> Any:
+            ufp.devices_ws_subscription = ws_callback
+            return Mock()
+
+        ufp_public_client.subscribe_devices_websocket = subscribe_devices_websocket
+        ufp_public_client.subscribe_devices_websocket_state = Mock(return_value=Mock())
+        yield ufp
+
+
 @pytest.fixture(name="old_nvr")
 def old_nvr():
     """Mock UniFi Protect Camera device."""
@@ -154,6 +232,7 @@ def mock_ufp_client(bootstrap: Bootstrap):
     client.update = AsyncMock(return_value=bootstrap)
     client.async_disconnect_ws = AsyncMock()
     client.has_public_bootstrap = False
+    client.is_public_only = False
     return client
 
 

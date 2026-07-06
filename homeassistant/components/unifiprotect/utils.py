@@ -114,12 +114,14 @@ def async_create_api_client(
 
     session = async_create_clientsession(hass, cookie_jar=CookieJar(unsafe=True))
     public_api_session = async_create_clientsession(hass)
+    # Without local credentials the client runs in public-only mode and
+    # authenticates every request with the API key instead of a session.
     return ProtectApiClient(
         host=entry.data[CONF_HOST],
         port=entry.data[CONF_PORT],
-        username=entry.data[CONF_USERNAME],
-        password=entry.data[CONF_PASSWORD],
-        api_key=entry.data.get("api_key"),
+        username=entry.data.get(CONF_USERNAME) or None,
+        password=entry.data.get(CONF_PASSWORD) or None,
+        api_key=entry.data.get("api_key") or None,
         verify_ssl=entry.data[CONF_VERIFY_SSL],
         session=session,
         public_api_session=public_api_session,
