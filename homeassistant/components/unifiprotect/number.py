@@ -4,7 +4,9 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import timedelta
 import logging
+from typing import cast
 
+from uiprotect.api import PublicApiChimeRingSettingRequest
 from uiprotect.data import (
     Camera,
     Chime,
@@ -12,19 +14,24 @@ from uiprotect.data import (
     Light,
     ModelType,
     ProtectAdoptableDeviceModel,
+    PublicChime,
 )
 
 from homeassistant.components.number import NumberEntity, NumberEntityDescription
 from homeassistant.const import PERCENTAGE, EntityCategory, UnitOfTime
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
+from .const import DOMAIN
 from .data import ProtectData, ProtectDeviceType, UFPConfigEntry
 from .entity import (
     PermRequired,
     ProtectDeviceEntity,
     ProtectEntityDescription,
+    ProtectPublicDeviceEntity,
     ProtectSettableKeysMixin,
+    PublicDeviceWithMac,
     T,
     async_all_device_entities,
 )
@@ -296,6 +303,113 @@ def _async_all_chime_ring_volume_entities(
     return entities
 
 
+class ProtectPublicChimeRingVolume(ProtectPublicDeviceEntity, NumberEntity):
+    """Ring volume per paired camera on a chime, backed by the public API.
+
+    Used for API-key-only (public-only) config entries, where the private
+    bootstrap — and with it :class:`ChimeRingVolumeNumber` — is unavailable.
+    """
+
+    _attr_native_max_value: float = 100
+    _attr_native_min_value: float = 0
+    _attr_native_step: float = 1
+    _attr_native_unit_of_measurement = PERCENTAGE
+    _attr_entity_category = EntityCategory.CONFIG
+    _state_attrs = ("_attr_available", "_attr_native_value")
+
+    def __init__(
+        self,
+        data: ProtectData,
+        chime: PublicChime,
+        camera_id: str,
+        camera_name: str,
+    ) -> None:
+        """Initialize the ring volume number entity."""
+        self._ring_camera_id = camera_id
+        super().__init__(data, chime)
+        self._attr_unique_id = f"{chime.mac}_ring_volume_{camera_id}"
+        self._attr_translation_key = "chime_ring_volume"
+        self._attr_translation_placeholders = {"camera_name": camera_name}
+        # ProtectPublicDeviceEntity sets _attr_name = None when no description
+        # is passed, which prevents translation_key from being used. Delete to
+        # enable translations.
+        del self._attr_name
+
+    @callback
+    def _update_from_device(self, device: PublicDeviceWithMac) -> None:
+        super()._update_from_device(device)
+        chime = cast(PublicChime, device)
+        self._attr_native_value = next(
+            (
+                ring_setting.volume
+                for ring_setting in chime.ring_settings
+                if ring_setting.camera_id == self._ring_camera_id
+            ),
+            None,
+        )
+
+    @property
+    def _chime(self) -> PublicChime | None:
+        api = self.data.api
+        if not api.has_public_bootstrap:
+            return None
+        return api.public_bootstrap.chimes.get(self._device_id)
+
+    @async_ufp_instance_command
+    async def async_set_native_value(self, value: float) -> None:
+        """Set the ring volume for this camera on the chime."""
+        if (chime := self._chime) is None:
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="chime_not_available",
+            )
+        # PATCH semantics require the full ring settings list; carry the
+        # other cameras\' settings over unchanged.
+        ring_settings: list[PublicApiChimeRingSettingRequest] = []
+        for ring_setting in chime.ring_settings:
+            if not ring_setting.camera_id:
+                continue
+            request: PublicApiChimeRingSettingRequest = {
+                "cameraId": ring_setting.camera_id,
+                "repeatTimes": ring_setting.repeat_times or 1,
+                "volume": (
+                    int(value)
+                    if ring_setting.camera_id == self._ring_camera_id
+                    else ring_setting.volume or 100
+                ),
+            }
+            if ring_setting.ringtone_id is not None:
+                request["ringtoneId"] = ring_setting.ringtone_id
+            ring_settings.append(request)
+        await self.data.api.update_chime_public(
+            self._device_id, ring_settings=ring_settings
+        )
+
+
+@callback
+def _async_setup_public_numbers(
+    data: ProtectData,
+    async_add_entities: AddConfigEntryEntitiesCallback,
+) -> None:
+    """Set up number entities from the public API for an API-key-only entry."""
+    api = data.api
+    if not api.has_public_bootstrap:
+        return
+    public_bootstrap = api.public_bootstrap
+    entities: list[NumberEntity] = []
+    for chime in public_bootstrap.chimes.values():
+        for ring_setting in chime.ring_settings:
+            if not (camera_id := ring_setting.camera_id):
+                continue
+            camera = public_bootstrap.cameras.get(camera_id)
+            camera_name = (camera.name if camera else None) or camera_id
+            entities.append(
+                ProtectPublicChimeRingVolume(data, chime, camera_id, camera_name)
+            )
+    if entities:
+        async_add_entities(entities)
+
+
 async def async_setup_entry(
     hass: HomeAssistant,
     entry: UFPConfigEntry,
@@ -303,6 +417,10 @@ async def async_setup_entry(
 ) -> None:
     """Set up number entities for UniFi Protect integration."""
     data = entry.runtime_data
+
+    if data.api.is_public_only:
+        _async_setup_public_numbers(data, async_add_entities)
+        return
 
     @callback
     def _add_new_device(device: ProtectAdoptableDeviceModel) -> None:

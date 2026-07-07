@@ -81,6 +81,7 @@ def _make_public_bootstrap(relay: Mock | None) -> Mock:
     pb.cameras = {}
     pb.sensors = {}
     pb.lights = {}
+    pb.chimes = {}
     return pb
 
 

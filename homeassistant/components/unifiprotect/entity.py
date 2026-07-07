@@ -17,6 +17,7 @@ from uiprotect.data import (
     ModelType,
     ProtectAdoptableDeviceModel,
     ProtectModelWithId,
+    PublicChime,
     PublicLight,
     PublicSensor,
     SmartDetectObjectType,
@@ -43,7 +44,7 @@ T = TypeVar("T", bound=ProtectAdoptableDeviceModel | NVR)
 
 # Public-API device models that carry a MAC and connection state, usable
 # with ProtectPublicDeviceEntity.
-type PublicDeviceWithMac = PublicSensor | PublicLight
+type PublicDeviceWithMac = PublicSensor | PublicLight | PublicChime
 
 
 class PermRequired(int, Enum):

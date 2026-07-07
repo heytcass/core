@@ -109,6 +109,11 @@ class ProtectData:
         self._public_motion_subscriptions: defaultdict[
             str, set[Callable[[bool], None]]
         ] = defaultdict(set)
+        # Camera-id-keyed subscriptions for full events (ring, smart
+        # detections, ...) from the public events websocket.
+        self._public_camera_event_subscriptions: defaultdict[
+            str, set[Callable[[Event], None]]
+        ] = defaultdict(set)
         self._public_nvr_subscriptions: set[Callable[[], None]] = set()
         self._pending_camera_ids: set[str] = set()
         self._unsubs: list[CALLBACK_TYPE] = []
@@ -267,6 +272,7 @@ class ProtectData:
             elif old_obj is not None and old_obj.model in (
                 ModelType.SENSOR,
                 ModelType.LIGHT,
+                ModelType.CHIME,
             ):
                 self._async_signal_public_device_update(old_obj)
             return
@@ -279,7 +285,7 @@ class ProtectData:
         if new_obj.model is ModelType.CAMERA:
             self._async_signal_public_camera_update(cast(PublicCamera, new_obj))
             return
-        if new_obj.model in (ModelType.SENSOR, ModelType.LIGHT):
+        if new_obj.model in (ModelType.SENSOR, ModelType.LIGHT, ModelType.CHIME):
             self._async_signal_public_device_update(new_obj)
             return
         if new_obj.model is ModelType.RELAY:
@@ -483,7 +489,9 @@ class ProtectData:
             for camera in public_bootstrap.cameras.values():
                 self._async_signal_public_camera_update(camera)
             for public_device in chain(
-                public_bootstrap.sensors.values(), public_bootstrap.lights.values()
+                public_bootstrap.sensors.values(),
+                public_bootstrap.lights.values(),
+                public_bootstrap.chimes.values(),
             ):
                 self._async_signal_public_device_update(public_device)
 
@@ -592,16 +600,37 @@ class ProtectData:
             return
         if TYPE_CHECKING:
             assert isinstance(event, Event)
-        if event.type not in _PUBLIC_MOTION_EVENT_TYPES:
-            return
         if not (camera_id := event.camera_id):
             return
-        if not (subscriptions := self._public_motion_subscriptions.get(camera_id)):
-            return
-        is_on = event.end is None
-        _LOGGER.debug("Public motion event for %s: %s", camera_id, is_on)
-        for update_callback in subscriptions:
-            update_callback(is_on)
+        if event.type in _PUBLIC_MOTION_EVENT_TYPES and (
+            motion_subscriptions := self._public_motion_subscriptions.get(camera_id)
+        ):
+            is_on = event.end is None
+            _LOGGER.debug("Public motion event for %s: %s", camera_id, is_on)
+            for motion_callback in motion_subscriptions:
+                motion_callback(is_on)
+        if subscriptions := self._public_camera_event_subscriptions.get(camera_id):
+            for update_callback in subscriptions:
+                update_callback(event)
+
+    @callback
+    def async_subscribe_public_camera_events(
+        self, camera_id: str, update_callback: Callable[[Event], None]
+    ) -> CALLBACK_TYPE:
+        """Add a callback subscriber for public events WS events by camera id."""
+        self._public_camera_event_subscriptions[camera_id].add(update_callback)
+        return partial(
+            self._async_unsubscribe_public_camera_events, camera_id, update_callback
+        )
+
+    @callback
+    def _async_unsubscribe_public_camera_events(
+        self, camera_id: str, update_callback: Callable[[Event], None]
+    ) -> None:
+        """Remove a public camera events callback subscriber."""
+        self._public_camera_event_subscriptions[camera_id].remove(update_callback)
+        if not self._public_camera_event_subscriptions[camera_id]:
+            del self._public_camera_event_subscriptions[camera_id]
 
     @callback
     def async_subscribe_public_camera(

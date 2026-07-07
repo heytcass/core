@@ -677,6 +677,9 @@
     "api_key_required": {
       "message": "API key is required. Please reauthenticate this integration to provide an API key."
     },
+    "chime_not_available": {
+      "message": "Chime is not available."
+    },
     "command_error": {
       "message": "Error communicating with UniFi Protect while sending command: {error}"
     },

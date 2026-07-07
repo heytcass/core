@@ -966,6 +966,7 @@ async def test_public_only_binary_sensors(
     camera.model = ModelType.CAMERA
     camera.state = DeviceState.CONNECTED
     camera.rtsps_streams = None
+    camera.feature_flags = Mock(smart_detect_types=[])
     ufp_public.api.public_bootstrap.sensors = {sensor.id: sensor}
     ufp_public.api.public_bootstrap.lights = {light.id: light}
     ufp_public.api.public_bootstrap.cameras = {camera.id: camera}
@@ -1037,6 +1038,7 @@ async def test_public_only_camera_motion_via_events_ws(
     camera.model = ModelType.CAMERA
     camera.state = DeviceState.CONNECTED
     camera.rtsps_streams = None
+    camera.feature_flags = Mock(smart_detect_types=[])
     ufp_public.api.public_bootstrap.cameras = {camera.id: camera}
 
     await hass.config_entries.async_setup(ufp_public.entry.entry_id)
@@ -1074,5 +1076,68 @@ async def test_public_only_camera_motion_via_events_ws(
     await hass.async_block_till_done()
 
     state = hass.states.get(entity_id)
+    assert state is not None
+    assert state.state == STATE_OFF
+
+
+async def test_public_only_smart_detect_via_events_ws(
+    hass: HomeAssistant,
+    entity_registry: er.EntityRegistry,
+    ufp_public: MockUFPFixture,
+) -> None:
+    """Test smart detection sensors driven by the public events WS."""
+    camera = Mock(spec=PublicCamera)
+    camera.id = "test_public_camera_id"
+    camera.mac = "AABBCCDDEEFF"
+    camera.name = "Front Door"
+    camera.model = ModelType.CAMERA
+    camera.state = DeviceState.CONNECTED
+    camera.rtsps_streams = None
+    camera.feature_flags = Mock(
+        smart_detect_types=[SmartDetectObjectType.PERSON, SmartDetectObjectType.VEHICLE]
+    )
+    ufp_public.api.public_bootstrap.cameras = {camera.id: camera}
+
+    await hass.config_entries.async_setup(ufp_public.entry.entry_id)
+    await hass.async_block_till_done()
+
+    # motion + person + vehicle
+    assert_entity_counts(hass, Platform.BINARY_SENSOR, 3, 3)
+
+    person_entity_id = "binary_sensor.front_door_person_detected"
+    entity = entity_registry.async_get(person_entity_id)
+    assert entity is not None
+    assert entity.unique_id == "AABBCCDDEEFF_smart_obj_person"
+
+    state = hass.states.get(person_entity_id)
+    assert state is not None
+    assert state.state == STATE_UNKNOWN
+
+    event = Mock(spec=Event)
+    event.model = ModelType.EVENT
+    event.type = EventType.SMART_DETECT
+    event.camera_id = camera.id
+    event.smart_detect_types = [SmartDetectObjectType.PERSON]
+    event.end = None
+
+    mock_msg = Mock()
+    mock_msg.new_obj = event
+    assert ufp_public.events_ws_subscription is not None
+    ufp_public.events_ws_subscription(mock_msg)
+    await hass.async_block_till_done()
+
+    state = hass.states.get(person_entity_id)
+    assert state is not None
+    assert state.state == STATE_ON
+    # vehicle sensor untouched
+    state = hass.states.get("binary_sensor.front_door_vehicle_detected")
+    assert state is not None
+    assert state.state == STATE_UNKNOWN
+
+    event.end = dt_util.utcnow()
+    ufp_public.events_ws_subscription(mock_msg)
+    await hass.async_block_till_done()
+
+    state = hass.states.get(person_entity_id)
     assert state is not None
     assert state.state == STATE_OFF

@@ -75,6 +75,7 @@ def _make_public_bootstrap(siren: Mock | None) -> Mock:
     pb.cameras = {}
     pb.sensors = {}
     pb.lights = {}
+    pb.chimes = {}
     return pb
 
 

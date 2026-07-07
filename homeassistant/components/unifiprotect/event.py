@@ -3,7 +3,7 @@
 import dataclasses
 from typing import Any
 
-from uiprotect.data import ModelType
+from uiprotect.data import ModelType, PublicCamera
 from uiprotect.data.nvr import Event, EventDetectedThumbnail
 
 from homeassistant.components.event import (
@@ -13,12 +13,17 @@ from homeassistant.components.event import (
     EventEntityDescription,
 )
 from homeassistant.core import CALLBACK_TYPE, HomeAssistant, callback
+from homeassistant.helpers import device_registry as dr
+from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from homeassistant.helpers.event import async_call_at
 
 from . import Bootstrap
 from .const import (
     ATTR_EVENT_ID,
+    DEFAULT_ATTRIBUTION,
+    DEFAULT_BRAND,
+    DOMAIN,
     EVENT_TYPE_FINGERPRINT_IDENTIFIED,
     EVENT_TYPE_FINGERPRINT_NOT_IDENTIFIED,
     EVENT_TYPE_NFC_SCANNED,
@@ -411,6 +416,55 @@ def _async_event_entities(
     ]
 
 
+class ProtectPublicRingEventEntity(EventEntity):
+    """Doorbell ring event entity driven by the public events websocket.
+
+    Used for API-key-only (public-only) config entries. The public API does
+    not expose a doorbell feature flag, so one entity is created per camera;
+    it only ever fires on cameras that are doorbells.
+    """
+
+    _attr_attribution = DEFAULT_ATTRIBUTION
+    _attr_has_entity_name = True
+    _attr_should_poll = False
+    _attr_device_class = EventDeviceClass.DOORBELL
+    _attr_event_types = [DoorbellEventType.RING]
+    _attr_translation_key = "doorbell"
+
+    def __init__(self, data: ProtectData, camera: PublicCamera) -> None:
+        """Initialize the ring event entity."""
+        self.data = data
+        self._camera_id = camera.id
+        self._last_event_id: str | None = None
+        self._attr_unique_id = f"{camera.mac}_doorbell"
+        self._attr_device_info = DeviceInfo(
+            connections={(dr.CONNECTION_NETWORK_MAC, camera.mac)},
+            identifiers={(DOMAIN, camera.mac)},
+            manufacturer=DEFAULT_BRAND,
+            name=camera.name,
+        )
+        if (via_device := data.nvr_device_identifier) is not None:
+            self._attr_device_info["via_device"] = via_device
+
+    @callback
+    def _async_event(self, event: Event) -> None:
+        """Handle an event from the public events websocket."""
+        if event.type is not EventType.RING or event.id == self._last_event_id:
+            return
+        self._last_event_id = event.id
+        self._trigger_event(DoorbellEventType.RING, {ATTR_EVENT_ID: event.id})
+        self.async_write_ha_state()
+
+    async def async_added_to_hass(self) -> None:
+        """Subscribe to camera events dispatched by ProtectData."""
+        await super().async_added_to_hass()
+        self.async_on_remove(
+            self.data.async_subscribe_public_camera_events(
+                self._camera_id, self._async_event
+            )
+        )
+
+
 async def async_setup_entry(
     hass: HomeAssistant,
     entry: UFPConfigEntry,
@@ -418,6 +472,14 @@ async def async_setup_entry(
 ) -> None:
     """Set up event entities for UniFi Protect integration."""
     data = entry.runtime_data
+
+    if data.api.is_public_only:
+        if data.api.has_public_bootstrap:
+            async_add_entities(
+                ProtectPublicRingEventEntity(data, camera)
+                for camera in data.api.public_bootstrap.cameras.values()
+            )
+        return
 
     @callback
     def _add_new_device(device: ProtectAdoptableDeviceModel) -> None:
