@@ -1628,9 +1628,12 @@ async def test_public_only_doorbell_ring(
     camera.state = DeviceState.CONNECTED
     camera.rtsps_streams = None
     camera.feature_flags = Mock(smart_detect_types=[])
-    # Non-None LCD message marks the camera as a doorbell
-    camera.lcd_message = Mock()
+    camera.lcd_message = None
     ufp_public.api.public_bootstrap.cameras = {camera.id: camera}
+    # Chime pairing marks the camera as a doorbell
+    chime = Mock(camera_ids=[camera.id], mac="CHIME0000001", ring_settings=[])
+    chime.model = ModelType.CHIME
+    ufp_public.api.public_bootstrap.chimes = {"chime1": chime}
 
     await hass.config_entries.async_setup(ufp_public.entry.entry_id)
     await hass.async_block_till_done()

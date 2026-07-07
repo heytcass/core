@@ -55,8 +55,14 @@ type ProtectDeviceType = ProtectAdoptableDeviceModel | NVR
 type UFPConfigEntry = ConfigEntry[ProtectData]
 
 # Event types from the public events websocket that drive the motion state
-# of public-only camera entities.
-_PUBLIC_MOTION_EVENT_TYPES = {EventType.MOTION}
+# of public-only camera entities. Consoles with smart detections enabled
+# emit smart detection events instead of plain motion events, so those
+# count as motion activity too.
+_PUBLIC_MOTION_EVENT_TYPES = {
+    EventType.MOTION,
+    EventType.SMART_DETECT,
+    EventType.SMART_DETECT_LINE,
+}
 
 
 @callback
@@ -597,6 +603,7 @@ class ProtectData:
         """
         event = message.new_obj
         if event is None or event.model is not ModelType.EVENT:
+            _LOGGER.debug("Public event without event object: %s", message.changed_data)
             return
         if TYPE_CHECKING:
             assert isinstance(event, Event)
@@ -604,6 +611,12 @@ class ProtectData:
         # which the private Event model (built around the "camera" key) does
         # not pick up — fall back to the raw payload.
         camera_id = event.camera_id or message.changed_data.get("device")
+        _LOGGER.debug(
+            "Public event: type=%s camera_id=%s active=%s",
+            event.type,
+            camera_id,
+            event.end is None,
+        )
         if not camera_id:
             return
         if event.type in _PUBLIC_MOTION_EVENT_TYPES and (

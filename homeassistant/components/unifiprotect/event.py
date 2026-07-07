@@ -477,7 +477,9 @@ async def async_setup_entry(
         if data.api.has_public_bootstrap:
             public_bootstrap = data.api.public_bootstrap
             # The public API exposes no doorbell flag; treat cameras paired
-            # to a chime, or carrying an LCD message, as doorbells.
+            # to a chime as doorbells. (An LCD-message heuristic was tried
+            # and rejected: current firmware includes the field on all
+            # cameras.)
             chime_paired_camera_ids = {
                 camera_id
                 for chime in public_bootstrap.chimes.values()
@@ -487,7 +489,6 @@ async def async_setup_entry(
                 ProtectPublicRingEventEntity(data, camera)
                 for camera in public_bootstrap.cameras.values()
                 if camera.id in chime_paired_camera_ids
-                or camera.lcd_message is not None
             )
         return
 
