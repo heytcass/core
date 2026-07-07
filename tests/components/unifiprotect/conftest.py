@@ -141,6 +141,7 @@ def mock_ufp_public_client(public_nvr: PublicNVR):
     public_bootstrap.arm_profiles = {}
     public_bootstrap.relays = {}
     public_bootstrap.sirens = {}
+    public_bootstrap.cameras = {}
     client.public_bootstrap = public_bootstrap
 
     client.get_meta_info = AsyncMock(return_value=MetaInfo(applicationVersion="6.0.0"))

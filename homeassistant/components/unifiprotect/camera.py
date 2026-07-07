@@ -6,14 +6,17 @@ import logging
 from uiprotect.data import (
     Camera as UFPCamera,
     CameraChannel,
+    DeviceState,
     ModelType,
     ProtectAdoptableDeviceModel,
+    PublicCamera,
     StateType,
 )
 
 from homeassistant.components.camera import Camera, CameraEntityFeature
 from homeassistant.core import HomeAssistant, callback
-from homeassistant.helpers import issue_registry as ir
+from homeassistant.helpers import device_registry as dr, issue_registry as ir
+from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from homeassistant.helpers.issue_registry import IssueSeverity
@@ -24,6 +27,8 @@ from .const import (
     ATTR_FPS,
     ATTR_HEIGHT,
     ATTR_WIDTH,
+    DEFAULT_ATTRIBUTION,
+    DEFAULT_BRAND,
     DOMAIN,
 )
 from .data import ProtectData, ProtectDeviceType, UFPConfigEntry
@@ -147,6 +152,10 @@ async def async_setup_entry(
     """Discover cameras on a UniFi Protect NVR."""
     data = entry.runtime_data
 
+    if data.api.is_public_only:
+        _async_setup_public_cameras(data, async_add_entities)
+        return
+
     @callback
     def _add_new_device(device: ProtectAdoptableDeviceModel) -> None:
         # AiPort inherits from Camera but should not create camera entities
@@ -166,8 +175,28 @@ async def async_setup_entry(
     async_add_entities(_async_camera_entities(hass, entry, data))
 
 
+@callback
+def _async_setup_public_cameras(
+    data: ProtectData,
+    async_add_entities: AddConfigEntryEntitiesCallback,
+) -> None:
+    """Set up cameras from the public API for an API-key-only entry."""
+    api = data.api
+    if not api.has_public_bootstrap:
+        return
+    disable_stream = data.disable_stream
+    if entities := [
+        ProtectPublicCamera(data, camera, disable_stream)
+        for camera in api.public_bootstrap.cameras.values()
+    ]:
+        async_add_entities(entities)
+
+
 _DISABLE_FEATURE = CameraEntityFeature(0)
 _ENABLE_FEATURE = CameraEntityFeature.STREAM
+
+# Preference order when picking the stream for a public-API camera.
+_PUBLIC_STREAM_QUALITIES = ("high", "medium", "low")
 
 
 class ProtectCamera(ProtectDeviceEntity, Camera):
@@ -274,3 +303,103 @@ class ProtectCamera(ProtectDeviceEntity, Camera):
     async def async_disable_motion_detection(self) -> None:
         """Call the job and disable motion detection."""
         await self.device.set_motion_detection(False)
+
+
+class ProtectPublicCamera(Camera):
+    """Camera entity backed exclusively by the public API.
+
+    Used for API-key-only (public-only) config entries, where the private
+    bootstrap — and with it :class:`ProtectCamera` — is unavailable. Streams
+    use the RTSPS URLs the library primes on the public camera objects;
+    snapshots go through the public snapshot endpoint.
+    """
+
+    _attr_attribution = DEFAULT_ATTRIBUTION
+    _attr_has_entity_name = True
+    _attr_name = None
+    _attr_should_poll = False
+
+    def __init__(
+        self,
+        data: ProtectData,
+        camera: PublicCamera,
+        disable_stream: bool,
+    ) -> None:
+        """Initialize a public-API camera."""
+        super().__init__()
+        self.data = data
+        self._camera_id = camera.id
+        self._camera_mac = camera.mac
+        self._disable_stream = disable_stream
+        self._stream_source: str | None = None
+        self._attr_unique_id = f"{camera.mac}_camera"
+        self._attr_device_info = DeviceInfo(
+            connections={(dr.CONNECTION_NETWORK_MAC, camera.mac)},
+            identifiers={(DOMAIN, camera.mac)},
+            manufacturer=DEFAULT_BRAND,
+            name=camera.name,
+        )
+        if (via_device := data.nvr_device_identifier) is not None:
+            self._attr_device_info["via_device"] = via_device
+        self._update_from_camera(camera)
+
+    @property
+    def _camera(self) -> PublicCamera | None:
+        api = self.data.api
+        if not api.has_public_bootstrap:
+            return None
+        return api.public_bootstrap.cameras.get(self._camera_id)
+
+    @callback
+    def _update_from_camera(self, camera: PublicCamera) -> None:
+        """Refresh availability and stream source from the cached camera."""
+        self._attr_available = (
+            self.data.last_update_success and camera.state is DeviceState.CONNECTED
+        )
+        source: str | None = None
+        if not self._disable_stream and (streams := camera.rtsps_streams) is not None:
+            for quality in _PUBLIC_STREAM_QUALITIES:
+                # SRTP disabled because go2rtc does not support it
+                # https://github.com/AlexxIT/go2rtc/#source-rtsp
+                if (url := streams.get_stream_url(quality, srtp=False)) is not None:
+                    source = url
+                    break
+        self._attr_supported_features = _ENABLE_FEATURE if source else _DISABLE_FEATURE
+        self._stream_source = source
+
+    @callback
+    def _async_updated(self, camera: PublicCamera) -> None:
+        """Handle a public camera WS update."""
+        previous_state = (self._attr_available, self._stream_source)
+        self._update_from_camera(camera)
+        # If the camera was removed from the bootstrap while the WS update
+        # was in flight, mark unavailable.
+        if self._camera is None:
+            self._attr_available = False
+        if (self._attr_available, self._stream_source) != previous_state:
+            self.async_write_ha_state()
+
+    async def async_added_to_hass(self) -> None:
+        """Subscribe to public camera WS updates dispatched by ProtectData."""
+        await super().async_added_to_hass()
+        self.async_on_remove(
+            self.data.async_subscribe_public_camera(
+                self._camera_mac, self._async_updated
+            )
+        )
+
+    async def stream_source(self) -> str | None:
+        """Return the stream source."""
+        return self._stream_source
+
+    async def async_camera_image(
+        self, width: int | None = None, height: int | None = None
+    ) -> bytes | None:
+        """Return the camera image."""
+        camera = self._camera
+        high_quality = (
+            camera.feature_flags.support_full_hd_snapshot if camera else False
+        )
+        return await self.data.api.get_public_api_camera_snapshot(
+            camera_id=self._camera_id, high_quality=high_quality
+        )

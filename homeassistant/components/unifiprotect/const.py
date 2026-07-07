@@ -55,6 +55,10 @@ DEVICES_FOR_SUBSCRIBE = DEVICES_WITH_ENTITIES | {ModelType.EVENT}
 # Public API devices WebSocket: NVR (for arm_mode updates), Relay
 # (for relay output state updates), and Siren (for siren active-state updates).
 DEVICES_WS_SUBSCRIBED_MODELS = {ModelType.NVR, ModelType.RELAY, ModelType.SIREN}
+# API-key-only entries additionally drive camera entities from the public API.
+DEVICES_WS_SUBSCRIBED_MODELS_PUBLIC_ONLY = DEVICES_WS_SUBSCRIBED_MODELS | {
+    ModelType.CAMERA
+}
 
 MIN_REQUIRED_PROTECT_V = Version("6.0.0")
 OUTDATED_LOG_MESSAGE = (

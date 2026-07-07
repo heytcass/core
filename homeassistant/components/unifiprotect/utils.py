@@ -36,6 +36,7 @@ from .const import (
     CONF_OVERRIDE_CHOST,
     DEVICES_FOR_SUBSCRIBE,
     DEVICES_WS_SUBSCRIBED_MODELS,
+    DEVICES_WS_SUBSCRIBED_MODELS_PUBLIC_ONLY,
     DOMAIN,
     ModelType,
 )
@@ -116,17 +117,22 @@ def async_create_api_client(
     public_api_session = async_create_clientsession(hass)
     # Without local credentials the client runs in public-only mode and
     # authenticates every request with the API key instead of a session.
+    username = entry.data.get(CONF_USERNAME) or None
+    password = entry.data.get(CONF_PASSWORD) or None
+    public_only = username is None and password is None
     return ProtectApiClient(
         host=entry.data[CONF_HOST],
         port=entry.data[CONF_PORT],
-        username=entry.data.get(CONF_USERNAME) or None,
-        password=entry.data.get(CONF_PASSWORD) or None,
+        username=username,
+        password=password,
         api_key=entry.data.get("api_key") or None,
         verify_ssl=entry.data[CONF_VERIFY_SSL],
         session=session,
         public_api_session=public_api_session,
         subscribed_models=DEVICES_FOR_SUBSCRIBE,
-        devices_ws_subscribed_models=DEVICES_WS_SUBSCRIBED_MODELS,
+        devices_ws_subscribed_models=DEVICES_WS_SUBSCRIBED_MODELS_PUBLIC_ONLY
+        if public_only
+        else DEVICES_WS_SUBSCRIBED_MODELS,
         override_connection_host=entry.options.get(CONF_OVERRIDE_CHOST, False),
         ignore_stats=not entry.options.get(CONF_ALL_UPDATES, False),
         ignore_unadopted=False,

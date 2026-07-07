@@ -17,6 +17,7 @@ from uiprotect.data import (
     ModelType,
     ProtectAdoptableDeviceModel,
     PTZPatrol,
+    PublicCamera,
     Relay,
     Siren,
     WSSubscriptionMessage,
@@ -89,6 +90,9 @@ class ProtectData:
         self._siren_subscriptions: defaultdict[str, set[Callable[[Siren], None]]] = (
             defaultdict(set)
         )
+        self._public_camera_subscriptions: defaultdict[
+            str, set[Callable[[PublicCamera], None]]
+        ] = defaultdict(set)
         self._public_nvr_subscriptions: set[Callable[[], None]] = set()
         self._pending_camera_ids: set[str] = set()
         self._unsubs: list[CALLBACK_TYPE] = []
@@ -237,12 +241,17 @@ class ProtectData:
             old_obj = message.old_obj
             if old_obj is not None and old_obj.model is ModelType.SIREN:
                 self._async_signal_siren_update(cast(Siren, old_obj))
+            elif old_obj is not None and old_obj.model is ModelType.CAMERA:
+                self._async_signal_public_camera_update(cast(PublicCamera, old_obj))
             return
         if new_obj.model is ModelType.NVR:
             if self.api.is_public_only:
                 self._async_signal_public_nvr_update()
             else:
                 self._async_signal_device_update(self.api.bootstrap.nvr)
+            return
+        if new_obj.model is ModelType.CAMERA:
+            self._async_signal_public_camera_update(cast(PublicCamera, new_obj))
             return
         if new_obj.model is ModelType.RELAY:
             relay = cast(Relay, new_obj)
@@ -435,12 +444,15 @@ class ProtectData:
         for device in self.get_by_types(DEVICES_THAT_ADOPT):
             self._async_signal_device_update(device)
         if self.api.has_public_bootstrap:
-            for relay in self.api.public_bootstrap.relays.values():
+            public_bootstrap = self.api.public_bootstrap
+            for relay in public_bootstrap.relays.values():
                 if subscriptions := self._relay_subscriptions.get(relay.mac):
                     for subscription_callback in subscriptions:
                         subscription_callback(relay)
-            for siren in self.api.public_bootstrap.sirens.values():
+            for siren in public_bootstrap.sirens.values():
                 self._async_signal_siren_update(siren)
+            for camera in public_bootstrap.cameras.values():
+                self._async_signal_public_camera_update(camera)
 
     @callback
     def _async_poll(self, now: datetime) -> None:
@@ -485,6 +497,33 @@ class ProtectData:
         self._relay_subscriptions[mac].remove(update_callback)
         if not self._relay_subscriptions[mac]:
             del self._relay_subscriptions[mac]
+
+    @callback
+    def async_subscribe_public_camera(
+        self, mac: str, update_callback: Callable[[PublicCamera], None]
+    ) -> CALLBACK_TYPE:
+        """Add a callback subscriber for public-API camera updates."""
+        self._public_camera_subscriptions[mac].add(update_callback)
+        return partial(self._async_unsubscribe_public_camera, mac, update_callback)
+
+    @callback
+    def _async_unsubscribe_public_camera(
+        self, mac: str, update_callback: Callable[[PublicCamera], None]
+    ) -> None:
+        """Remove a public camera callback subscriber."""
+        self._public_camera_subscriptions[mac].remove(update_callback)
+        if not self._public_camera_subscriptions[mac]:
+            del self._public_camera_subscriptions[mac]
+
+    @callback
+    def _async_signal_public_camera_update(self, camera: PublicCamera) -> None:
+        """Call the callbacks for a public camera mac."""
+        mac = camera.mac
+        if not (subscriptions := self._public_camera_subscriptions.get(mac)):
+            return
+        _LOGGER.debug("Updating public camera: %s (%s)", camera.name, mac)
+        for update_callback in subscriptions:
+            update_callback(camera)
 
     @callback
     def async_subscribe_public_nvr(
