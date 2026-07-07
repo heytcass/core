@@ -935,6 +935,7 @@ def _make_public_sensor() -> Mock:
     sensor.is_opened = False
     sensor.is_motion_detected = False
     sensor.battery_status = Mock(percentage=87, is_low=False)
+    sensor.mount_type = MountType.DOOR
     return sensor
 
 

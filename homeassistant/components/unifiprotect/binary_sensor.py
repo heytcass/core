@@ -975,16 +975,26 @@ def _async_setup_public_binary_sensors(
     if not api.has_public_bootstrap:
         return
     public_bootstrap = api.public_bootstrap
-    entities: list[BinarySensorEntity] = [
-        ProtectPublicBinarySensor(data, device, description)
-        for devices, descriptions in (
-            (public_bootstrap.sensors.values(), PUBLIC_SENSE_SENSORS),
-            (public_bootstrap.lights.values(), PUBLIC_LIGHT_SENSORS),
-        )
-        for device in devices
-        for description in descriptions
-        if description.ufp_required_fn(device)
-    ]
+    entities: list[BinarySensorEntity] = []
+    for devices, descriptions in (
+        (public_bootstrap.sensors.values(), PUBLIC_SENSE_SENSORS),
+        (public_bootstrap.lights.values(), PUBLIC_LIGHT_SENSORS),
+    ):
+        for device in devices:
+            for description in descriptions:
+                if not description.ufp_required_fn(device):
+                    continue
+                if description.key == _KEY_DOOR:
+                    # Match the private integration: the contact sensor's
+                    # device class follows the sensor's mount type.
+                    description = dataclasses.replace(
+                        description,
+                        device_class=MOUNT_DEVICE_CLASS_MAP.get(
+                            cast(PublicSensor, device).mount_type,
+                            BinarySensorDeviceClass.DOOR,
+                        ),
+                    )
+                entities.append(ProtectPublicBinarySensor(data, device, description))
     entities.extend(
         ProtectPublicCameraMotionSensor(data, camera)
         for camera in public_bootstrap.cameras.values()
