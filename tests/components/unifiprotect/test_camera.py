@@ -724,6 +724,7 @@ def _make_public_camera(
     camera.state = state
     camera.rtsps_streams = rtsps_streams
     camera.feature_flags = Mock(support_full_hd_snapshot=False, smart_detect_types=[])
+    camera.lcd_message = None
     return camera
 
 

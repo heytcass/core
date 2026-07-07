@@ -1628,6 +1628,8 @@ async def test_public_only_doorbell_ring(
     camera.state = DeviceState.CONNECTED
     camera.rtsps_streams = None
     camera.feature_flags = Mock(smart_detect_types=[])
+    # Non-None LCD message marks the camera as a doorbell
+    camera.lcd_message = Mock()
     ufp_public.api.public_bootstrap.cameras = {camera.id: camera}
 
     await hass.config_entries.async_setup(ufp_public.entry.entry_id)
@@ -1659,3 +1661,26 @@ async def test_public_only_doorbell_ring(
     assert state is not None
     assert state.state != STATE_UNKNOWN
     assert state.attributes["event_type"] == "ring"
+
+
+async def test_public_only_no_doorbell_entity_for_non_doorbell(
+    hass: HomeAssistant,
+    entity_registry: er.EntityRegistry,
+    ufp_public: MockUFPFixture,
+) -> None:
+    """Test no ring entity is created for cameras that are not doorbells."""
+    camera = Mock(spec=PublicCamera)
+    camera.id = "test_public_camera_id"
+    camera.mac = "AABBCCDDEEFF"
+    camera.name = "Garage"
+    camera.model = ModelType.CAMERA
+    camera.state = DeviceState.CONNECTED
+    camera.rtsps_streams = None
+    camera.feature_flags = Mock(smart_detect_types=[])
+    camera.lcd_message = None
+    ufp_public.api.public_bootstrap.cameras = {camera.id: camera}
+
+    await hass.config_entries.async_setup(ufp_public.entry.entry_id)
+    await hass.async_block_till_done()
+
+    assert entity_registry.async_get("event.garage_doorbell") is None

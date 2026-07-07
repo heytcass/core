@@ -461,6 +461,7 @@ async def test_public_only_chime_ring_volume(
     camera.state = DeviceState.CONNECTED
     camera.rtsps_streams = None
     camera.feature_flags = Mock(smart_detect_types=[])
+    camera.lcd_message = None
 
     chime = Mock(spec=PublicChime)
     chime.id = "test_public_chime_id"

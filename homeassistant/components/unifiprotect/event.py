@@ -420,8 +420,8 @@ class ProtectPublicRingEventEntity(EventEntity):
     """Doorbell ring event entity driven by the public events websocket.
 
     Used for API-key-only (public-only) config entries. The public API does
-    not expose a doorbell feature flag, so one entity is created per camera;
-    it only ever fires on cameras that are doorbells.
+    not expose a doorbell feature flag, so doorbells are identified by chime
+    pairing or the presence of an LCD message.
     """
 
     _attr_attribution = DEFAULT_ATTRIBUTION
@@ -475,9 +475,19 @@ async def async_setup_entry(
 
     if data.api.is_public_only:
         if data.api.has_public_bootstrap:
+            public_bootstrap = data.api.public_bootstrap
+            # The public API exposes no doorbell flag; treat cameras paired
+            # to a chime, or carrying an LCD message, as doorbells.
+            chime_paired_camera_ids = {
+                camera_id
+                for chime in public_bootstrap.chimes.values()
+                for camera_id in chime.camera_ids
+            }
             async_add_entities(
                 ProtectPublicRingEventEntity(data, camera)
-                for camera in data.api.public_bootstrap.cameras.values()
+                for camera in public_bootstrap.cameras.values()
+                if camera.id in chime_paired_camera_ids
+                or camera.lcd_message is not None
             )
         return
 

@@ -600,7 +600,11 @@ class ProtectData:
             return
         if TYPE_CHECKING:
             assert isinstance(event, Event)
-        if not (camera_id := event.camera_id):
+        # The public events payload identifies the camera in a "device" field,
+        # which the private Event model (built around the "camera" key) does
+        # not pick up — fall back to the raw payload.
+        camera_id = event.camera_id or message.changed_data.get("device")
+        if not camera_id:
             return
         if event.type in _PUBLIC_MOTION_EVENT_TYPES and (
             motion_subscriptions := self._public_motion_subscriptions.get(camera_id)

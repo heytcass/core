@@ -968,6 +968,7 @@ async def test_public_only_binary_sensors(
     camera.state = DeviceState.CONNECTED
     camera.rtsps_streams = None
     camera.feature_flags = Mock(smart_detect_types=[])
+    camera.lcd_message = None
     ufp_public.api.public_bootstrap.sensors = {sensor.id: sensor}
     ufp_public.api.public_bootstrap.lights = {light.id: light}
     ufp_public.api.public_bootstrap.cameras = {camera.id: camera}
@@ -1040,6 +1041,7 @@ async def test_public_only_camera_motion_via_events_ws(
     camera.state = DeviceState.CONNECTED
     camera.rtsps_streams = None
     camera.feature_flags = Mock(smart_detect_types=[])
+    camera.lcd_message = None
     ufp_public.api.public_bootstrap.cameras = {camera.id: camera}
 
     await hass.config_entries.async_setup(ufp_public.entry.entry_id)
@@ -1097,6 +1099,7 @@ async def test_public_only_smart_detect_via_events_ws(
     camera.feature_flags = Mock(
         smart_detect_types=[SmartDetectObjectType.PERSON, SmartDetectObjectType.VEHICLE]
     )
+    camera.lcd_message = None
     ufp_public.api.public_bootstrap.cameras = {camera.id: camera}
 
     await hass.config_entries.async_setup(ufp_public.entry.entry_id)
@@ -1142,3 +1145,42 @@ async def test_public_only_smart_detect_via_events_ws(
     state = hass.states.get(person_entity_id)
     assert state is not None
     assert state.state == STATE_OFF
+
+
+async def test_public_only_motion_event_device_id_fallback(
+    hass: HomeAssistant,
+    ufp_public: MockUFPFixture,
+) -> None:
+    """Test motion events identified only by the payload device field."""
+    camera = Mock(spec=PublicCamera)
+    camera.id = "test_public_camera_id"
+    camera.mac = "AABBCCDDEEFF"
+    camera.name = "Front Door"
+    camera.model = ModelType.CAMERA
+    camera.state = DeviceState.CONNECTED
+    camera.rtsps_streams = None
+    camera.feature_flags = Mock(smart_detect_types=[])
+    camera.lcd_message = None
+    ufp_public.api.public_bootstrap.cameras = {camera.id: camera}
+
+    await hass.config_entries.async_setup(ufp_public.entry.entry_id)
+    await hass.async_block_till_done()
+
+    # The public events payload carries the camera id in "device", which the
+    # private Event model does not map to camera_id.
+    event = Mock(spec=Event)
+    event.model = ModelType.EVENT
+    event.type = EventType.MOTION
+    event.camera_id = None
+    event.end = None
+
+    mock_msg = Mock()
+    mock_msg.new_obj = event
+    mock_msg.changed_data = {"device": camera.id, "type": "motion"}
+    assert ufp_public.events_ws_subscription is not None
+    ufp_public.events_ws_subscription(mock_msg)
+    await hass.async_block_till_done()
+
+    state = hass.states.get("binary_sensor.front_door_motion")
+    assert state is not None
+    assert state.state == STATE_ON
