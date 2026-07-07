@@ -7,11 +7,15 @@ import pytest
 from uiprotect.data import (
     AiPort,
     Camera,
+    DeviceState,
     Event,
     EventType,
     Light,
     ModelType,
     MountType,
+    PublicCamera,
+    PublicLight,
+    PublicSensor,
     Sensor,
     SmartDetectObjectType,
 )
@@ -36,10 +40,12 @@ from homeassistant.const import (
     STATE_OFF,
     STATE_ON,
     STATE_UNAVAILABLE,
+    STATE_UNKNOWN,
     Platform,
 )
 from homeassistant.core import Event as HAEvent, EventStateChangedData, HomeAssistant
 from homeassistant.helpers import entity_registry as er
+from homeassistant.util import dt as dt_util
 
 from .utils import (
     MockUFPFixture,
@@ -916,3 +922,157 @@ async def test_binary_sensor_simultaneous_person_and_vehicle_detection(
     assert person_state.state == STATE_OFF, (
         "Person detection should be OFF after event ends"
     )
+
+
+def _make_public_sensor() -> Mock:
+    """Create a public API UP Sense sensor for testing."""
+    sensor = Mock(spec=PublicSensor)
+    sensor.id = "test_public_sensor_id"
+    sensor.mac = "SENSE0000001"
+    sensor.name = "Garage Door"
+    sensor.model = ModelType.SENSOR
+    sensor.state = DeviceState.CONNECTED
+    sensor.is_opened = False
+    sensor.is_motion_detected = False
+    sensor.battery_status = Mock(percentage=87, is_low=False)
+    return sensor
+
+
+def _make_public_light() -> Mock:
+    """Create a public API light for testing."""
+    light = Mock(spec=PublicLight)
+    light.id = "test_public_light_id"
+    light.mac = "LIGHT0000001"
+    light.name = "Driveway Light"
+    light.model = ModelType.LIGHT
+    light.state = DeviceState.CONNECTED
+    light.is_dark = True
+    light.is_pir_motion_detected = False
+    return light
+
+
+async def test_public_only_binary_sensors(
+    hass: HomeAssistant,
+    entity_registry: er.EntityRegistry,
+    ufp_public: MockUFPFixture,
+) -> None:
+    """Test binary sensors on an API-key-only (public-only) entry."""
+    sensor = _make_public_sensor()
+    light = _make_public_light()
+    camera = Mock(spec=PublicCamera)
+    camera.id = "test_public_camera_id"
+    camera.mac = "AABBCCDDEEFF"
+    camera.name = "Front Door"
+    camera.model = ModelType.CAMERA
+    camera.state = DeviceState.CONNECTED
+    camera.rtsps_streams = None
+    ufp_public.api.public_bootstrap.sensors = {sensor.id: sensor}
+    ufp_public.api.public_bootstrap.lights = {light.id: light}
+    ufp_public.api.public_bootstrap.cameras = {camera.id: camera}
+
+    await hass.config_entries.async_setup(ufp_public.entry.entry_id)
+    await hass.async_block_till_done()
+
+    # sensor: door + motion + battery low; light: dark + motion; camera: motion
+    assert_entity_counts(hass, Platform.BINARY_SENSOR, 6, 6)
+
+    state = hass.states.get("binary_sensor.garage_door_door")
+    assert state is not None
+    assert state.state == STATE_OFF
+
+    state = hass.states.get("binary_sensor.garage_door_motion")
+    assert state is not None
+    assert state.state == STATE_OFF
+
+    state = hass.states.get("binary_sensor.garage_door_battery")
+    assert state is not None
+    assert state.state == STATE_OFF
+
+    state = hass.states.get("binary_sensor.driveway_light_is_dark")
+    assert state is not None
+    assert state.state == STATE_ON
+
+
+async def test_public_only_binary_sensor_ws_update(
+    hass: HomeAssistant,
+    ufp_public: MockUFPFixture,
+) -> None:
+    """Test public devices WS updates refresh public binary sensors."""
+    sensor = _make_public_sensor()
+    ufp_public.api.public_bootstrap.sensors = {sensor.id: sensor}
+
+    await hass.config_entries.async_setup(ufp_public.entry.entry_id)
+    await hass.async_block_till_done()
+
+    state = hass.states.get("binary_sensor.garage_door_door")
+    assert state is not None
+    assert state.state == STATE_OFF
+
+    opened = _make_public_sensor()
+    opened.is_opened = True
+    ufp_public.api.public_bootstrap.sensors = {opened.id: opened}
+
+    mock_msg = Mock()
+    mock_msg.changed_data = {}
+    mock_msg.new_obj = opened
+    assert ufp_public.devices_ws_subscription is not None
+    ufp_public.devices_ws_subscription(mock_msg)
+    await hass.async_block_till_done()
+
+    state = hass.states.get("binary_sensor.garage_door_door")
+    assert state is not None
+    assert state.state == STATE_ON
+
+
+async def test_public_only_camera_motion_via_events_ws(
+    hass: HomeAssistant,
+    entity_registry: er.EntityRegistry,
+    ufp_public: MockUFPFixture,
+) -> None:
+    """Test camera motion binary sensor driven by the public events WS."""
+    camera = Mock(spec=PublicCamera)
+    camera.id = "test_public_camera_id"
+    camera.mac = "AABBCCDDEEFF"
+    camera.name = "Front Door"
+    camera.model = ModelType.CAMERA
+    camera.state = DeviceState.CONNECTED
+    camera.rtsps_streams = None
+    ufp_public.api.public_bootstrap.cameras = {camera.id: camera}
+
+    await hass.config_entries.async_setup(ufp_public.entry.entry_id)
+    await hass.async_block_till_done()
+
+    entity_id = "binary_sensor.front_door_motion"
+    entity = entity_registry.async_get(entity_id)
+    assert entity is not None
+    assert entity.unique_id == "AABBCCDDEEFF_motion"
+
+    state = hass.states.get(entity_id)
+    assert state is not None
+    assert state.state == STATE_UNKNOWN
+
+    # Motion event starts (no end time)
+    event = Mock(spec=Event)
+    event.model = ModelType.EVENT
+    event.type = EventType.MOTION
+    event.camera_id = camera.id
+    event.end = None
+
+    mock_msg = Mock()
+    mock_msg.new_obj = event
+    assert ufp_public.events_ws_subscription is not None
+    ufp_public.events_ws_subscription(mock_msg)
+    await hass.async_block_till_done()
+
+    state = hass.states.get(entity_id)
+    assert state is not None
+    assert state.state == STATE_ON
+
+    # Motion event ends
+    event.end = dt_util.utcnow()
+    ufp_public.events_ws_subscription(mock_msg)
+    await hass.async_block_till_done()
+
+    state = hass.states.get(entity_id)
+    assert state is not None
+    assert state.state == STATE_OFF

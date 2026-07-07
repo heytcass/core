@@ -1,15 +1,20 @@
 """Component providing binary sensors for UniFi Protect."""
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 import dataclasses
+from typing import cast
 
 from uiprotect.data import (
     NVR,
     Camera,
+    DeviceState,
     Event,
     ModelType,
     MountType,
     ProtectAdoptableDeviceModel,
+    PublicCamera,
+    PublicLight,
+    PublicSensor,
     Sensor,
     SmartDetectObjectType,
 )
@@ -22,8 +27,11 @@ from homeassistant.components.binary_sensor import (
 )
 from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers import device_registry as dr
+from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
+from .const import DEFAULT_ATTRIBUTION, DEFAULT_BRAND, DOMAIN
 from .data import ProtectData, ProtectDeviceType, UFPConfigEntry
 from .entity import (
     BaseProtectEntity,
@@ -34,6 +42,8 @@ from .entity import (
     ProtectEventMixin,
     ProtectIsOnEntity,
     ProtectNVREntity,
+    ProtectPublicDeviceEntity,
+    PublicDeviceWithMac,
     async_all_device_entities,
 )
 
@@ -740,6 +750,153 @@ def _async_nvr_entities(
     ]
 
 
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class ProtectPublicBinaryEntityDescription(BinarySensorEntityDescription):
+    """Describes a binary sensor backed by a public-API device."""
+
+    ufp_value_fn: Callable[[PublicDeviceWithMac], bool | None]
+    ufp_required_fn: Callable[[PublicDeviceWithMac], bool] = lambda _: True
+
+
+PUBLIC_SENSE_SENSORS: tuple[ProtectPublicBinaryEntityDescription, ...] = (
+    ProtectPublicBinaryEntityDescription(
+        key=_KEY_DOOR,
+        device_class=BinarySensorDeviceClass.DOOR,
+        ufp_value_fn=lambda device: cast(PublicSensor, device).is_opened,
+        ufp_required_fn=lambda device: cast(PublicSensor, device).is_opened is not None,
+    ),
+    ProtectPublicBinaryEntityDescription(
+        key="motion",
+        device_class=BinarySensorDeviceClass.MOTION,
+        ufp_value_fn=lambda device: cast(PublicSensor, device).is_motion_detected,
+    ),
+    ProtectPublicBinaryEntityDescription(
+        key="battery_low",
+        device_class=BinarySensorDeviceClass.BATTERY,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        ufp_value_fn=lambda device: cast(PublicSensor, device).battery_status.is_low,
+    ),
+)
+
+PUBLIC_LIGHT_SENSORS: tuple[ProtectPublicBinaryEntityDescription, ...] = (
+    ProtectPublicBinaryEntityDescription(
+        key="dark",
+        translation_key="is_dark",
+        ufp_value_fn=lambda device: cast(PublicLight, device).is_dark,
+    ),
+    ProtectPublicBinaryEntityDescription(
+        key="motion",
+        device_class=BinarySensorDeviceClass.MOTION,
+        ufp_value_fn=lambda device: cast(PublicLight, device).is_pir_motion_detected,
+    ),
+)
+
+
+class ProtectPublicBinarySensor(ProtectPublicDeviceEntity, BinarySensorEntity):
+    """A public-API device binary sensor for API-key-only entries."""
+
+    entity_description: ProtectPublicBinaryEntityDescription
+    _state_attrs = ("_attr_available", "_attr_is_on")
+
+    @callback
+    def _update_from_device(self, device: PublicDeviceWithMac) -> None:
+        super()._update_from_device(device)
+        self._attr_is_on = self.entity_description.ufp_value_fn(device)
+
+
+class ProtectPublicCameraMotionSensor(BinarySensorEntity):
+    """Camera motion sensor driven by the public events websocket.
+
+    Used for API-key-only (public-only) config entries. Motion state comes
+    from motion events on the public events websocket; availability follows
+    the camera's connection state from the public devices websocket.
+    """
+
+    _attr_attribution = DEFAULT_ATTRIBUTION
+    _attr_device_class = BinarySensorDeviceClass.MOTION
+    _attr_has_entity_name = True
+    _attr_should_poll = False
+
+    def __init__(self, data: ProtectData, camera: PublicCamera) -> None:
+        """Initialize the camera motion sensor."""
+        self.data = data
+        self._camera_id = camera.id
+        self._camera_mac = camera.mac
+        self._attr_unique_id = f"{camera.mac}_motion"
+        self._attr_device_info = DeviceInfo(
+            connections={(dr.CONNECTION_NETWORK_MAC, camera.mac)},
+            identifiers={(DOMAIN, camera.mac)},
+            manufacturer=DEFAULT_BRAND,
+            name=camera.name,
+        )
+        if (via_device := data.nvr_device_identifier) is not None:
+            self._attr_device_info["via_device"] = via_device
+        self._attr_available = (
+            data.last_update_success and camera.state is DeviceState.CONNECTED
+        )
+        # Unknown until the first motion event arrives.
+        self._attr_is_on = None
+
+    @callback
+    def _async_motion_changed(self, is_on: bool) -> None:
+        """Handle a motion event from the public events websocket."""
+        if self._attr_is_on != is_on:
+            self._attr_is_on = is_on
+            self.async_write_ha_state()
+
+    @callback
+    def _async_camera_updated(self, camera: PublicCamera) -> None:
+        """Handle a public camera WS update for availability."""
+        available = (
+            self.data.last_update_success and camera.state is DeviceState.CONNECTED
+        )
+        if self._attr_available != available:
+            self._attr_available = available
+            self.async_write_ha_state()
+
+    async def async_added_to_hass(self) -> None:
+        """Subscribe to motion events and camera updates."""
+        await super().async_added_to_hass()
+        self.async_on_remove(
+            self.data.async_subscribe_public_motion(
+                self._camera_id, self._async_motion_changed
+            )
+        )
+        self.async_on_remove(
+            self.data.async_subscribe_public_camera(
+                self._camera_mac, self._async_camera_updated
+            )
+        )
+
+
+@callback
+def _async_setup_public_binary_sensors(
+    data: ProtectData,
+    async_add_entities: AddConfigEntryEntitiesCallback,
+) -> None:
+    """Set up binary sensors from the public API for an API-key-only entry."""
+    api = data.api
+    if not api.has_public_bootstrap:
+        return
+    public_bootstrap = api.public_bootstrap
+    entities: list[BinarySensorEntity] = [
+        ProtectPublicBinarySensor(data, device, description)
+        for devices, descriptions in (
+            (public_bootstrap.sensors.values(), PUBLIC_SENSE_SENSORS),
+            (public_bootstrap.lights.values(), PUBLIC_LIGHT_SENSORS),
+        )
+        for device in devices
+        for description in descriptions
+        if description.ufp_required_fn(device)
+    ]
+    entities.extend(
+        ProtectPublicCameraMotionSensor(data, camera)
+        for camera in public_bootstrap.cameras.values()
+    )
+    if entities:
+        async_add_entities(entities)
+
+
 async def async_setup_entry(
     hass: HomeAssistant,
     entry: UFPConfigEntry,
@@ -747,6 +904,10 @@ async def async_setup_entry(
 ) -> None:
     """Set up binary sensors for UniFi Protect integration."""
     data = entry.runtime_data
+
+    if data.api.is_public_only:
+        _async_setup_public_binary_sensors(data, async_add_entities)
+        return
 
     @callback
     def _add_new_device(device: ProtectAdoptableDeviceModel) -> None:

@@ -839,6 +839,8 @@ def _make_public_bootstrap(arm_mode: Mock | None, profiles: dict[str, Mock]) -> 
     pb.relays = {}
     pb.sirens = {}
     pb.cameras = {}
+    pb.sensors = {}
+    pb.lights = {}
     return pb
 
 

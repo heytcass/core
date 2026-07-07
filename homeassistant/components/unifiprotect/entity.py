@@ -7,14 +7,18 @@ from enum import Enum
 from functools import partial
 import logging
 from operator import attrgetter
-from typing import TYPE_CHECKING, Any, Generic, TypeVar
+from typing import TYPE_CHECKING, Any, Generic, TypeVar, cast
 
 from uiprotect import make_enabled_getter, make_required_getter, make_value_getter
 from uiprotect.data import (
     NVR,
+    DeviceState,
     Event,
     ModelType,
     ProtectAdoptableDeviceModel,
+    ProtectModelWithId,
+    PublicLight,
+    PublicSensor,
     SmartDetectObjectType,
     StateType,
 )
@@ -36,6 +40,10 @@ from .data import ProtectData, ProtectDeviceType
 _LOGGER = logging.getLogger(__name__)
 
 T = TypeVar("T", bound=ProtectAdoptableDeviceModel | NVR)
+
+# Public-API device models that carry a MAC and connection state, usable
+# with ProtectPublicDeviceEntity.
+type PublicDeviceWithMac = PublicSensor | PublicLight
 
 
 class PermRequired(int, Enum):
@@ -270,6 +278,74 @@ class BaseProtectEntity(Entity):
             self.data.async_subscribe(self.device.mac, self._async_updated_event)
         )
         self._async_update_device_from_protect(self.device)
+
+
+class ProtectPublicDeviceEntity(Entity):
+    """Base class for entities backed exclusively by the public API.
+
+    Used for API-key-only (public-only) config entries, where the private
+    bootstrap — and with it :class:`BaseProtectEntity` — is unavailable.
+    State lives on the public bootstrap objects; updates arrive through the
+    public devices websocket via :meth:`ProtectData.async_subscribe_public_device`.
+    """
+
+    _attr_attribution = DEFAULT_ATTRIBUTION
+    _attr_has_entity_name = True
+    _attr_should_poll = False
+
+    _state_attrs: tuple[str, ...] = ("_attr_available",)
+
+    def __init__(
+        self,
+        data: ProtectData,
+        device: PublicDeviceWithMac,
+        description: EntityDescription | None = None,
+    ) -> None:
+        """Initialize a public-API device entity."""
+        super().__init__()
+        self.data = data
+        self._device_id = device.id
+        self._device_mac = device.mac
+        if description is None:
+            self._attr_unique_id = device.mac
+            self._attr_name = None
+        else:
+            self.entity_description = description
+            self._attr_unique_id = f"{device.mac}_{description.key}"
+        self._attr_device_info = DeviceInfo(
+            connections={(dr.CONNECTION_NETWORK_MAC, device.mac)},
+            identifiers={(DOMAIN, device.mac)},
+            manufacturer=DEFAULT_BRAND,
+            name=device.name,
+        )
+        if (via_device := data.nvr_device_identifier) is not None:
+            self._attr_device_info["via_device"] = via_device
+        self._update_from_device(device)
+
+    @callback
+    def _update_from_device(self, device: PublicDeviceWithMac) -> None:
+        """Refresh entity state from the public device object."""
+        self._attr_available = (
+            self.data.last_update_success and device.state is DeviceState.CONNECTED
+        )
+
+    @callback
+    def _async_updated(self, device: ProtectModelWithId) -> None:
+        """Handle a public device WS update dispatched by ProtectData."""
+        public_device = cast("PublicDeviceWithMac", device)
+        previous_state = [getattr(self, attr, None) for attr in self._state_attrs]
+        self._update_from_device(public_device)
+        if previous_state != [getattr(self, attr, None) for attr in self._state_attrs]:
+            self.async_write_ha_state()
+
+    async def async_added_to_hass(self) -> None:
+        """Subscribe to public device WS updates dispatched by ProtectData."""
+        await super().async_added_to_hass()
+        self.async_on_remove(
+            self.data.async_subscribe_public_device(
+                self._device_mac, self._async_updated
+            )
+        )
 
 
 class ProtectIsOnEntity(BaseProtectEntity):

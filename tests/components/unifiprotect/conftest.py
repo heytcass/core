@@ -142,6 +142,8 @@ def mock_ufp_public_client(public_nvr: PublicNVR):
     public_bootstrap.relays = {}
     public_bootstrap.sirens = {}
     public_bootstrap.cameras = {}
+    public_bootstrap.sensors = {}
+    public_bootstrap.lights = {}
     client.public_bootstrap = public_bootstrap
 
     client.get_meta_info = AsyncMock(return_value=MetaInfo(applicationVersion="6.0.0"))
@@ -174,7 +176,14 @@ def mock_public_entry(
             ufp.devices_ws_subscription = ws_callback
             return Mock()
 
+        def subscribe_events_websocket(
+            ws_callback: Callable[[WSSubscriptionMessage], None],
+        ) -> Any:
+            ufp.events_ws_subscription = ws_callback
+            return Mock()
+
         ufp_public_client.subscribe_devices_websocket = subscribe_devices_websocket
+        ufp_public_client.subscribe_events_websocket = subscribe_events_websocket
         ufp_public_client.subscribe_devices_websocket_state = Mock(return_value=Mock())
         yield ufp
 
