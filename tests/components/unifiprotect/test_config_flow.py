@@ -299,6 +299,154 @@ async def test_user_flow_api_key_only_version_too_old(
     assert result["errors"] == {"base": "protect_version"}
 
 
+async def test_form_reauth_api_key_only(
+    hass: HomeAssistant,
+    public_nvr: PublicNVR,
+    ufp_api_key_config_entry: MockConfigEntry,
+    mock_setup: AsyncMock,
+) -> None:
+    """Test reauth flow on an API-key-only entry."""
+    ufp_api_key_config_entry.add_to_hass(hass)
+
+    result = await ufp_api_key_config_entry.start_reauth_flow(hass)
+    assert result["type"] is FlowResultType.FORM
+    assert not result["errors"]
+
+    with patch(
+        "homeassistant.components.unifiprotect.config_flow.ProtectApiClient.get_meta_info",
+        side_effect=NotAuthorized,
+    ):
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            {"api_key": "revoked-api-key"},
+        )
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["errors"] == {"api_key": "invalid_auth"}
+
+    with (
+        patch(
+            "homeassistant.components.unifiprotect.config_flow.ProtectApiClient.get_meta_info",
+            return_value=MetaInfo(applicationVersion="6.0.0"),
+        ),
+        patch(
+            "homeassistant.components.unifiprotect.config_flow.ProtectApiClient.get_nvr_public",
+            return_value=public_nvr,
+        ),
+    ):
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            {"api_key": "new-api-key"},
+        )
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "reauth_successful"
+    assert ufp_api_key_config_entry.data[CONF_API_KEY] == "new-api-key"
+    assert CONF_USERNAME not in ufp_api_key_config_entry.data
+    assert CONF_PASSWORD not in ufp_api_key_config_entry.data
+
+
+async def test_reconfigure_api_key_only(
+    hass: HomeAssistant,
+    public_nvr: PublicNVR,
+    ufp_api_key_config_entry: MockConfigEntry,
+    mock_setup: AsyncMock,
+) -> None:
+    """Test reconfigure flow on an API-key-only entry."""
+    ufp_api_key_config_entry.add_to_hass(hass)
+
+    result = await ufp_api_key_config_entry.start_reconfigure_flow(hass)
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "reconfigure"
+
+    with (
+        patch(
+            "homeassistant.components.unifiprotect.config_flow.ProtectApiClient.get_meta_info",
+            return_value=MetaInfo(applicationVersion="6.0.0"),
+        ),
+        patch(
+            "homeassistant.components.unifiprotect.config_flow.ProtectApiClient.get_nvr_public",
+            return_value=public_nvr,
+        ),
+    ):
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            {
+                CONF_HOST: "2.2.2.2",
+                CONF_PORT: DEFAULT_PORT,
+                CONF_VERIFY_SSL: DEFAULT_VERIFY_SSL,
+                CONF_API_KEY: "new-api-key",
+            },
+        )
+        await hass.async_block_till_done()
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "reconfigure_successful"
+    assert ufp_api_key_config_entry.data[CONF_HOST] == "2.2.2.2"
+    assert ufp_api_key_config_entry.data[CONF_API_KEY] == "new-api-key"
+    assert CONF_USERNAME not in ufp_api_key_config_entry.data
+
+
+async def test_discovered_by_unifi_discovery_api_key_only(
+    hass: HomeAssistant, public_nvr: PublicNVR
+) -> None:
+    """Test a discovery from unifi-discovery completed with only an API key."""
+
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN,
+        context={"source": config_entries.SOURCE_INTEGRATION_DISCOVERY},
+        data=UNIFI_DISCOVERY_DICT_PARTIAL,
+    )
+    await hass.async_block_till_done()
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "discovery_confirm"
+    assert not result["errors"]
+
+    with (
+        patch(
+            "homeassistant.components.unifiprotect.config_flow.ProtectApiClient.get_meta_info",
+            return_value=MetaInfo(applicationVersion="6.0.0"),
+        ),
+        patch(
+            "homeassistant.components.unifiprotect.config_flow.ProtectApiClient.get_nvr_public",
+            return_value=public_nvr,
+        ),
+        patch(
+            "homeassistant.components.unifiprotect.async_setup_entry",
+            return_value=True,
+        ) as mock_setup_entry,
+        patch(
+            "homeassistant.components.unifiprotect.async_setup",
+            return_value=True,
+        ) as mock_setup,
+    ):
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            {"api_key": DEFAULT_API_KEY},
+        )
+        await hass.async_block_till_done()
+
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert result["title"] == "Test NVR"
+    assert result["data"] == {
+        "host": DEVICE_IP_ADDRESS,
+        "username": "",
+        "password": "",
+        "api_key": DEFAULT_API_KEY,
+        "id": "Test NVR",
+        "port": 443,
+        "verify_ssl": False,
+    }
+    # Discovery knows the console MAC, so it is kept as the unique id even
+    # for API-key-only entries.
+    assert result["result"].unique_id == _async_unifi_mac_from_hass(
+        DEVICE_MAC_ADDRESS.upper().replace(":", "")
+    )
+    assert len(mock_setup_entry.mock_calls) == 1
+    assert len(mock_setup.mock_calls) == 1
+
+
 async def test_form_version_too_old(
     hass: HomeAssistant, bootstrap: Bootstrap, old_nvr: NVR, nvr: NVR, mock_setup: None
 ) -> None:
