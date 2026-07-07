@@ -7,6 +7,7 @@ from syrupy.assertion import SnapshotAssertion
 from uiprotect import NvrError, ProtectApiClient
 from uiprotect.api import DEVICE_UPDATE_INTERVAL
 from uiprotect.data import NVR, Bootstrap, CloudAccount, Light
+from uiprotect.data.nvr import MetaInfo
 from uiprotect.exceptions import BadRequest, NotAuthorized
 
 from homeassistant.components.unifiprotect.const import (
@@ -321,6 +322,85 @@ async def test_setup_failed_auth(hass: HomeAssistant, ufp: MockUFPFixture) -> No
 
     await hass.config_entries.async_reload(ufp.entry.entry_id)
     assert ufp.entry.state is ConfigEntryState.SETUP_ERROR
+
+
+async def test_setup_public_only(
+    hass: HomeAssistant,
+    device_registry: dr.DeviceRegistry,
+    ufp_public: MockUFPFixture,
+) -> None:
+    """Test setup of an API-key-only entry against the public API."""
+
+    await hass.config_entries.async_setup(ufp_public.entry.entry_id)
+    await hass.async_block_till_done()
+
+    assert ufp_public.entry.state is ConfigEntryState.LOADED
+    assert ufp_public.api.update_public.called
+    assert not ufp_public.api.update.called
+
+    nvr_device = device_registry.async_get_device(
+        identifiers={(DOMAIN, "test_nvr_id")},
+    )
+    assert nvr_device is not None
+    assert nvr_device.name == "Test NVR"
+    assert nvr_device.sw_version == "6.0.0"
+
+
+async def test_setup_public_only_failed_auth(
+    hass: HomeAssistant, ufp_public: MockUFPFixture
+) -> None:
+    """Test API-key-only setup with unauthorized error after retries."""
+
+    ufp_public.api.get_meta_info = AsyncMock(side_effect=NotAuthorized)
+
+    await hass.config_entries.async_setup(ufp_public.entry.entry_id)
+    assert ufp_public.entry.state is ConfigEntryState.SETUP_RETRY
+
+    for _ in range(AUTH_RETRIES - 1):
+        await hass.config_entries.async_reload(ufp_public.entry.entry_id)
+        assert ufp_public.entry.state is ConfigEntryState.SETUP_RETRY
+
+    await hass.config_entries.async_reload(ufp_public.entry.entry_id)
+    assert ufp_public.entry.state is ConfigEntryState.SETUP_ERROR
+
+
+async def test_setup_public_only_too_old(
+    hass: HomeAssistant, ufp_public: MockUFPFixture
+) -> None:
+    """Test API-key-only setup on outdated firmware."""
+
+    ufp_public.api.get_meta_info = AsyncMock(
+        return_value=MetaInfo(applicationVersion="5.3.0")
+    )
+
+    await hass.config_entries.async_setup(ufp_public.entry.entry_id)
+    await hass.async_block_till_done()
+    assert ufp_public.entry.state is ConfigEntryState.SETUP_ERROR
+
+
+async def test_setup_public_only_revoked_key_on_update(
+    hass: HomeAssistant, ufp_public: MockUFPFixture
+) -> None:
+    """Test API-key-only setup where priming the public bootstrap fails auth."""
+
+    ufp_public.api.update_public = AsyncMock(side_effect=NotAuthorized)
+
+    await hass.config_entries.async_setup(ufp_public.entry.entry_id)
+    await hass.async_block_till_done()
+    assert ufp_public.entry.state is ConfigEntryState.SETUP_ERROR
+    assert ufp_public.api.async_disconnect_ws.called
+
+
+async def test_setup_public_only_no_nvr_data(
+    hass: HomeAssistant, ufp_public: MockUFPFixture
+) -> None:
+    """Test API-key-only setup when the public NVR endpoint returns nothing."""
+
+    ufp_public.api.public_bootstrap.nvr = None
+
+    await hass.config_entries.async_setup(ufp_public.entry.entry_id)
+    await hass.async_block_till_done()
+    assert ufp_public.entry.state is ConfigEntryState.SETUP_RETRY
 
 
 async def test_setup_starts_discovery(

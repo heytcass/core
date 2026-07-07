@@ -225,6 +225,7 @@ async def test_browse_media_root_multiple_consoles(
     api2.get_nvr = AsyncMock(return_value=bootstrap2.nvr)
     api2.update = AsyncMock(return_value=bootstrap2)
     api2.async_disconnect_ws = AsyncMock()
+    api2.is_public_only = False
 
     with patch(
         "homeassistant.components.unifiprotect.utils.ProtectApiClient"
@@ -291,6 +292,7 @@ async def test_browse_media_root_multiple_consoles_only_one_media(
     api2.get_nvr = AsyncMock(return_value=bootstrap2.nvr)
     api2.update = AsyncMock(return_value=bootstrap2)
     api2.async_disconnect_ws = AsyncMock()
+    api2.is_public_only = False
 
     with patch(
         "homeassistant.components.unifiprotect.utils.ProtectApiClient"

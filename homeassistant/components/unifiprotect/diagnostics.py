@@ -15,5 +15,19 @@ async def async_get_config_entry_diagnostics(
     """Return diagnostics for a config entry."""
 
     data = config_entry.runtime_data
-    bootstrap = cast(dict[str, Any], anonymize_data(data.api.bootstrap.unifi_dict()))
+    api = data.api
+    if api.is_public_only:
+        # Only the public bootstrap exists for API-key-only entries.
+        nvr: dict[str, Any] | None = None
+        if api.has_public_bootstrap and api.public_bootstrap.nvr is not None:
+            nvr = cast(
+                dict[str, Any],
+                anonymize_data(api.public_bootstrap.nvr.unifi_dict()),
+            )
+        return {
+            "public_only": True,
+            "nvr": nvr,
+            "options": dict(config_entry.options),
+        }
+    bootstrap = cast(dict[str, Any], anonymize_data(api.bootstrap.unifi_dict()))
     return {"bootstrap": bootstrap, "options": dict(config_entry.options)}

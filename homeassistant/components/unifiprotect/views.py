@@ -147,6 +147,10 @@ class ProtectProxyView(HomeAssistantView):
             async_get_data_for_nvr_id(self.hass, nvr_id_or_entry_id)
             or async_get_data_for_entry_id(self.hass, nvr_id_or_entry_id)
         ):
+            # Media endpoints are part of the private API, which is
+            # unavailable when authenticating with an API key only.
+            if data.api.is_public_only:
+                return _404("Media is not available for API key only entries")
             return data
         return _404("Invalid NVR ID")
 

@@ -8,9 +8,11 @@ import pytest
 from uiprotect.data import (
     AiPort,
     Camera,
+    DeviceState,
     Event,
     EventType,
     ModelType,
+    PublicCamera,
     SmartDetectObjectType,
 )
 
@@ -19,8 +21,9 @@ from homeassistant.components.unifiprotect.const import (
     DEFAULT_ATTRIBUTION,
 )
 from homeassistant.components.unifiprotect.event import EVENT_DESCRIPTIONS
-from homeassistant.const import ATTR_ATTRIBUTION, Platform
+from homeassistant.const import ATTR_ATTRIBUTION, STATE_UNKNOWN, Platform
 from homeassistant.core import Event as HAEvent, HomeAssistant, callback
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.event import async_track_state_change_event
 
 from .utils import (
@@ -1609,3 +1612,78 @@ async def test_aiport_no_event_entities(
     # AI Port should not create any camera-specific event entities
     # (doorbell, motion, etc.)
     assert_entity_counts(hass, Platform.EVENT, 0, 0)
+
+
+async def test_public_only_doorbell_ring(
+    hass: HomeAssistant,
+    entity_registry: er.EntityRegistry,
+    ufp_public: MockUFPFixture,
+) -> None:
+    """Test doorbell ring event entity on an API-key-only entry."""
+    camera = Mock(spec=PublicCamera)
+    camera.id = "test_public_camera_id"
+    camera.mac = "AABBCCDDEEFF"
+    camera.name = "Front Door"
+    camera.model = ModelType.CAMERA
+    camera.state = DeviceState.CONNECTED
+    camera.rtsps_streams = None
+    camera.feature_flags = Mock(smart_detect_types=[])
+    camera.lcd_message = None
+    ufp_public.api.public_bootstrap.cameras = {camera.id: camera}
+    # Chime pairing marks the camera as a doorbell
+    chime = Mock(camera_ids=[camera.id], mac="CHIME0000001", ring_settings=[])
+    chime.model = ModelType.CHIME
+    ufp_public.api.public_bootstrap.chimes = {"chime1": chime}
+
+    await hass.config_entries.async_setup(ufp_public.entry.entry_id)
+    await hass.async_block_till_done()
+
+    entity_id = "event.front_door_doorbell"
+    entity = entity_registry.async_get(entity_id)
+    assert entity is not None
+    assert entity.unique_id == "AABBCCDDEEFF_doorbell"
+
+    state = hass.states.get(entity_id)
+    assert state is not None
+    assert state.state == STATE_UNKNOWN
+
+    ring_event = Mock(spec=Event)
+    ring_event.model = ModelType.EVENT
+    ring_event.type = EventType.RING
+    ring_event.camera_id = camera.id
+    ring_event.id = "ring-event-1"
+    ring_event.end = None
+
+    mock_msg = Mock()
+    mock_msg.new_obj = ring_event
+    assert ufp_public.events_ws_subscription is not None
+    ufp_public.events_ws_subscription(mock_msg)
+    await hass.async_block_till_done()
+
+    state = hass.states.get(entity_id)
+    assert state is not None
+    assert state.state != STATE_UNKNOWN
+    assert state.attributes["event_type"] == "ring"
+
+
+async def test_public_only_no_doorbell_entity_for_non_doorbell(
+    hass: HomeAssistant,
+    entity_registry: er.EntityRegistry,
+    ufp_public: MockUFPFixture,
+) -> None:
+    """Test no ring entity is created for cameras that are not doorbells."""
+    camera = Mock(spec=PublicCamera)
+    camera.id = "test_public_camera_id"
+    camera.mac = "AABBCCDDEEFF"
+    camera.name = "Garage"
+    camera.model = ModelType.CAMERA
+    camera.state = DeviceState.CONNECTED
+    camera.rtsps_streams = None
+    camera.feature_flags = Mock(smart_detect_types=[])
+    camera.lcd_message = None
+    ufp_public.api.public_bootstrap.cameras = {camera.id: camera}
+
+    await hass.config_entries.async_setup(ufp_public.entry.entry_id)
+    await hass.async_block_till_done()
+
+    assert entity_registry.async_get("event.garage_doorbell") is None

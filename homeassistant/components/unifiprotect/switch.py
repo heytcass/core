@@ -571,13 +571,14 @@ async def async_setup_entry(
     entities: list[BaseProtectEntity] = []
     entities += _make_entities(ProtectSwitch, _MODEL_DESCRIPTIONS)
     entities += _make_entities(ProtectPrivacyModeSwitch, _PRIVACY_DESCRIPTIONS)
-    bootstrap = data.api.bootstrap
-    nvr = bootstrap.nvr
-    if nvr.can_write(bootstrap.auth_user) and nvr.is_insights_enabled is not None:
-        entities.extend(
-            ProtectNVRSwitch(data, device=nvr, description=switch)
-            for switch in NVR_SWITCHES
-        )
+    if not data.api.is_public_only:
+        bootstrap = data.api.bootstrap
+        nvr = bootstrap.nvr
+        if nvr.can_write(bootstrap.auth_user) and nvr.is_insights_enabled is not None:
+            entities.extend(
+                ProtectNVRSwitch(data, device=nvr, description=switch)
+                for switch in NVR_SWITCHES
+            )
     async_add_entities(entities)
 
     # Public API: relay output switches. Only available when the public
@@ -622,15 +623,15 @@ class ProtectRelayOutputSwitch(SwitchEntity):
         self._attr_translation_placeholders = {
             "output_name": output.name or str(output.id),
         }
-        nvr = data.api.bootstrap.nvr
         self._attr_device_info = DeviceInfo(
             connections={(dr.CONNECTION_NETWORK_MAC, relay.mac)},
             identifiers={(DOMAIN, relay.mac)},
             manufacturer=DEFAULT_BRAND,
             name=relay.name,
             model="Relay",
-            via_device=(DOMAIN, nvr.mac),
         )
+        if (via_device := data.nvr_device_identifier) is not None:
+            self._attr_device_info["via_device"] = via_device
         self._update_from_relay(relay)
 
     @property

@@ -4,7 +4,17 @@ from datetime import datetime, timedelta
 from unittest.mock import Mock
 
 import pytest
-from uiprotect.data import NVR, AiPort, Camera, Event, EventType, ModelType, Sensor
+from uiprotect.data import (
+    NVR,
+    AiPort,
+    Camera,
+    DeviceState,
+    Event,
+    EventType,
+    ModelType,
+    PublicSensor,
+    Sensor,
+)
 from uiprotect.data.nvr import EventMetadata
 
 from homeassistant.components.unifiprotect.const import DEFAULT_ATTRIBUTION
@@ -561,3 +571,39 @@ async def test_aiport_no_camera_sensor_entities(
             # Camera-specific sensors should not exist for AI Port
             assert "detected_object" not in entity.unique_id
             assert "last_motion" not in entity.unique_id
+
+
+async def test_public_only_sensors(
+    hass: HomeAssistant,
+    entity_registry: er.EntityRegistry,
+    ufp_public: MockUFPFixture,
+) -> None:
+    """Test sensors on an API-key-only (public-only) entry."""
+    sense = Mock(spec=PublicSensor)
+    sense.id = "test_public_sensor_id"
+    sense.mac = "SENSE0000001"
+    sense.name = "Garage Door"
+    sense.model = ModelType.SENSOR
+    sense.state = DeviceState.CONNECTED
+    sense.stats = Mock(
+        temperature=Mock(value=21.5),
+        humidity=Mock(value=45.0),
+        light=Mock(value=120.0),
+    )
+    sense.battery_status = Mock(percentage=87, is_low=False)
+    ufp_public.api.public_bootstrap.sensors = {sense.id: sense}
+
+    await hass.config_entries.async_setup(ufp_public.entry.entry_id)
+    await hass.async_block_till_done()
+
+    assert_entity_counts(hass, Platform.SENSOR, 4, 4)
+
+    for entity_id, value in (
+        ("sensor.garage_door_temperature", "21.5"),
+        ("sensor.garage_door_humidity", "45.0"),
+        ("sensor.garage_door_illuminance", "120.0"),
+        ("sensor.garage_door_battery", "87"),
+    ):
+        state = hass.states.get(entity_id)
+        assert state is not None, entity_id
+        assert state.state == value

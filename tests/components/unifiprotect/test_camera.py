@@ -4,7 +4,16 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 from uiprotect.api import DEVICE_UPDATE_INTERVAL
-from uiprotect.data import AiPort, Camera as ProtectCamera, CameraChannel, StateType
+from uiprotect.data import (
+    AiPort,
+    Camera as ProtectCamera,
+    CameraChannel,
+    DeviceState,
+    ModelType,
+    PublicCamera,
+    RTSPSStreams,
+    StateType,
+)
 from uiprotect.exceptions import NvrError
 from uiprotect.websocket import WebsocketState
 from webrtc_models import RTCIceCandidateInit
@@ -699,3 +708,104 @@ async def test_aiport_rtsp_issue_cleanup(
 
     # Verify no camera entities were created
     assert_entity_counts(hass, Platform.CAMERA, 0, 0)
+
+
+def _make_public_camera(
+    *,
+    state: DeviceState = DeviceState.CONNECTED,
+    rtsps_streams: RTSPSStreams | None = None,
+) -> Mock:
+    """Create a public API camera for testing."""
+    camera = Mock(spec=PublicCamera)
+    camera.id = "test_public_camera_id"
+    camera.mac = "AABBCCDDEEFF"
+    camera.name = "Front Door"
+    camera.model = ModelType.CAMERA
+    camera.state = state
+    camera.rtsps_streams = rtsps_streams
+    camera.feature_flags = Mock(support_full_hd_snapshot=False, smart_detect_types=[])
+    camera.lcd_message = None
+    return camera
+
+
+async def test_public_only_camera(
+    hass: HomeAssistant,
+    entity_registry: er.EntityRegistry,
+    ufp_public: MockUFPFixture,
+) -> None:
+    """Test camera entity on an API-key-only (public-only) entry."""
+    streams = RTSPSStreams(high="rtsps://1.1.1.1:7441/abcd1234?enableSrtp")
+    camera = _make_public_camera(rtsps_streams=streams)
+    ufp_public.api.public_bootstrap.cameras = {camera.id: camera}
+    ufp_public.api.get_public_api_camera_snapshot = AsyncMock(return_value=b"snapshot")
+
+    await hass.config_entries.async_setup(ufp_public.entry.entry_id)
+    await hass.async_block_till_done()
+    assert_entity_counts(hass, Platform.CAMERA, 1, 1)
+
+    entity_id = "camera.front_door"
+    entity = entity_registry.async_get(entity_id)
+    assert entity is not None
+    assert entity.unique_id == "AABBCCDDEEFF_camera"
+
+    state = hass.states.get(entity_id)
+    assert state is not None
+    assert state.state == CameraState.IDLE
+    assert state.attributes[ATTR_SUPPORTED_FEATURES] == CameraEntityFeature.STREAM.value
+
+    # SRTP suffix is stripped because go2rtc does not support it
+    source = await async_get_stream_source(hass, entity_id)
+    assert source == "rtsps://1.1.1.1:7441/abcd1234"
+
+    image = await async_get_image(hass, entity_id)
+    assert image.content == b"snapshot"
+    ufp_public.api.get_public_api_camera_snapshot.assert_called_once_with(
+        camera_id="test_public_camera_id", high_quality=False
+    )
+
+
+async def test_public_only_camera_no_stream(
+    hass: HomeAssistant,
+    ufp_public: MockUFPFixture,
+) -> None:
+    """Test public-only camera without active RTSPS streams is snapshot only."""
+    camera = _make_public_camera(rtsps_streams=None)
+    ufp_public.api.public_bootstrap.cameras = {camera.id: camera}
+
+    await hass.config_entries.async_setup(ufp_public.entry.entry_id)
+    await hass.async_block_till_done()
+    assert_entity_counts(hass, Platform.CAMERA, 1, 1)
+
+    state = hass.states.get("camera.front_door")
+    assert state is not None
+    assert state.attributes[ATTR_SUPPORTED_FEATURES] == 0
+
+
+async def test_public_only_camera_ws_update(
+    hass: HomeAssistant,
+    ufp_public: MockUFPFixture,
+) -> None:
+    """Test public devices WS camera updates refresh availability."""
+    camera = _make_public_camera()
+    ufp_public.api.public_bootstrap.cameras = {camera.id: camera}
+
+    await hass.config_entries.async_setup(ufp_public.entry.entry_id)
+    await hass.async_block_till_done()
+
+    state = hass.states.get("camera.front_door")
+    assert state is not None
+    assert state.state == CameraState.IDLE
+
+    disconnected = _make_public_camera(state=DeviceState.DISCONNECTED)
+    ufp_public.api.public_bootstrap.cameras = {disconnected.id: disconnected}
+
+    mock_msg = Mock()
+    mock_msg.changed_data = {}
+    mock_msg.new_obj = disconnected
+    assert ufp_public.devices_ws_subscription is not None
+    ufp_public.devices_ws_subscription(mock_msg)
+    await hass.async_block_till_done()
+
+    state = hass.states.get("camera.front_door")
+    assert state is not None
+    assert state.state == STATE_UNAVAILABLE

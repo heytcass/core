@@ -393,18 +393,19 @@ async def async_setup_entry(
         )
     )
 
-    for camera in data.api.bootstrap.cameras.values():
-        if camera.feature_flags.is_ptz and camera.is_adopted_by_us:
-            patrols = data.ptz_patrols.get(camera.id, [])
-            entities.append(ProtectPTZPatrolSelect(data, camera, patrols))
-
     api = data.api
-    if (
-        api.has_public_bootstrap
-        and api.public_bootstrap.arm_mode is not None
-        and api.public_bootstrap.arm_profiles
-    ):
-        entities.append(ProtectNVRArmProfileSelect(data, device=api.bootstrap.nvr))
+    if not api.is_public_only:
+        for camera in api.bootstrap.cameras.values():
+            if camera.feature_flags.is_ptz and camera.is_adopted_by_us:
+                patrols = data.ptz_patrols.get(camera.id, [])
+                entities.append(ProtectPTZPatrolSelect(data, camera, patrols))
+
+        if (
+            api.has_public_bootstrap
+            and api.public_bootstrap.arm_mode is not None
+            and api.public_bootstrap.arm_profiles
+        ):
+            entities.append(ProtectNVRArmProfileSelect(data, device=api.bootstrap.nvr))
 
     async_add_entities(entities)
 

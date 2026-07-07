@@ -5,6 +5,7 @@ from collections import defaultdict
 from collections.abc import Callable, Generator, Iterable
 from datetime import datetime, timedelta
 from functools import partial
+from itertools import chain
 import logging
 from typing import TYPE_CHECKING, Any, cast
 
@@ -16,7 +17,9 @@ from uiprotect.data import (
     EventType,
     ModelType,
     ProtectAdoptableDeviceModel,
+    ProtectModelWithId,
     PTZPatrol,
+    PublicCamera,
     Relay,
     Siren,
     WSSubscriptionMessage,
@@ -50,6 +53,16 @@ from .utils import async_get_devices_by_type
 _LOGGER = logging.getLogger(__name__)
 type ProtectDeviceType = ProtectAdoptableDeviceModel | NVR
 type UFPConfigEntry = ConfigEntry[ProtectData]
+
+# Event types from the public events websocket that drive the motion state
+# of public-only camera entities. Consoles with smart detections enabled
+# emit smart detection events instead of plain motion events, so those
+# count as motion activity too.
+_PUBLIC_MOTION_EVENT_TYPES = {
+    EventType.MOTION,
+    EventType.SMART_DETECT,
+    EventType.SMART_DETECT_LINE,
+}
 
 
 @callback
@@ -89,6 +102,25 @@ class ProtectData:
         self._siren_subscriptions: defaultdict[str, set[Callable[[Siren], None]]] = (
             defaultdict(set)
         )
+        self._public_camera_subscriptions: defaultdict[
+            str, set[Callable[[PublicCamera], None]]
+        ] = defaultdict(set)
+        # Generic mac-keyed subscriptions for public-API device updates
+        # (sensors, lights, ...), used by public-only entities.
+        self._public_device_subscriptions: defaultdict[
+            str, set[Callable[[ProtectModelWithId], None]]
+        ] = defaultdict(set)
+        # Camera-id-keyed subscriptions for motion state derived from the
+        # public events websocket.
+        self._public_motion_subscriptions: defaultdict[
+            str, set[Callable[[bool], None]]
+        ] = defaultdict(set)
+        # Camera-id-keyed subscriptions for full events (ring, smart
+        # detections, ...) from the public events websocket.
+        self._public_camera_event_subscriptions: defaultdict[
+            str, set[Callable[[Event], None]]
+        ] = defaultdict(set)
+        self._public_nvr_subscriptions: set[Callable[[], None]] = set()
         self._pending_camera_ids: set[str] = set()
         self._unsubs: list[CALLBACK_TYPE] = []
         self._auth_failures = 0
@@ -105,6 +137,30 @@ class ProtectData:
     def disable_stream(self) -> bool:
         """Check if RTSP is disabled."""
         return self._entry.options.get(CONF_DISABLE_RTSP, False)  # type: ignore[no-any-return]
+
+    @property
+    def nvr_id(self) -> str | None:
+        """Return the NVR id in both private and public-only auth modes."""
+        api = self.api
+        if api.is_public_only:
+            if api.has_public_bootstrap and api.public_bootstrap.nvr is not None:
+                return api.public_bootstrap.nvr.id
+            return None
+        return api.bootstrap.nvr.id
+
+    @property
+    def nvr_device_identifier(self) -> tuple[str, str] | None:
+        """Return the registry identifier of the NVR device.
+
+        The private API exposes the NVR MAC, the public API only a stable id,
+        so the two auth modes use different identifier values.
+        """
+        api = self.api
+        if not api.is_public_only:
+            return (DOMAIN, api.bootstrap.nvr.mac)
+        if (nvr_id := self.nvr_id) is not None:
+            return (DOMAIN, nvr_id)
+        return None
 
     @property
     def max_events(self) -> int:
@@ -124,6 +180,10 @@ class ProtectData:
         self, device_types: Iterable[ModelType], ignore_unadopted: bool = True
     ) -> Generator[ProtectAdoptableDeviceModel]:
         """Get all devices matching types."""
+        # Devices from the private bootstrap do not exist in public-only
+        # (API-key-only) mode; entities for them are handled per platform.
+        if self.api.is_public_only:
+            return
         bootstrap = self.api.bootstrap
         for device_type in device_types:
             for device in async_get_devices_by_type(bootstrap, device_type).values():
@@ -165,8 +225,6 @@ class ProtectData:
         self._async_update_change(True, force_update=True)
         api = self.api
         self._unsubs = [
-            api.subscribe_websocket_state(self._async_websocket_state_changed),
-            api.subscribe_websocket(self._async_process_ws_message),
             async_track_time_interval(
                 self._hass, self._async_poll, self._update_interval
             ),
@@ -177,6 +235,24 @@ class ProtectData:
                 self._async_process_public_devices_ws_message
             ),
         ]
+        if api.is_public_only:
+            self._unsubs.extend(
+                (
+                    api.subscribe_devices_websocket_state(
+                        self._async_websocket_state_changed
+                    ),
+                    api.subscribe_events_websocket(
+                        self._async_process_public_events_ws_message
+                    ),
+                )
+            )
+        else:
+            self._unsubs.extend(
+                (
+                    api.subscribe_websocket_state(self._async_websocket_state_changed),
+                    api.subscribe_websocket(self._async_process_ws_message),
+                )
+            )
 
     @callback
     def _async_process_public_devices_ws_message(
@@ -197,9 +273,26 @@ class ProtectData:
             old_obj = message.old_obj
             if old_obj is not None and old_obj.model is ModelType.SIREN:
                 self._async_signal_siren_update(cast(Siren, old_obj))
+            elif old_obj is not None and old_obj.model is ModelType.CAMERA:
+                self._async_signal_public_camera_update(cast(PublicCamera, old_obj))
+            elif old_obj is not None and old_obj.model in (
+                ModelType.SENSOR,
+                ModelType.LIGHT,
+                ModelType.CHIME,
+            ):
+                self._async_signal_public_device_update(old_obj)
             return
         if new_obj.model is ModelType.NVR:
-            self._async_signal_device_update(self.api.bootstrap.nvr)
+            if self.api.is_public_only:
+                self._async_signal_public_nvr_update()
+            else:
+                self._async_signal_device_update(self.api.bootstrap.nvr)
+            return
+        if new_obj.model is ModelType.CAMERA:
+            self._async_signal_public_camera_update(cast(PublicCamera, new_obj))
+            return
+        if new_obj.model in (ModelType.SENSOR, ModelType.LIGHT, ModelType.CHIME):
+            self._async_signal_public_device_update(new_obj)
             return
         if new_obj.model is ModelType.RELAY:
             relay = cast(Relay, new_obj)
@@ -250,8 +343,12 @@ class ProtectData:
 
     async def async_refresh(self) -> None:
         """Update the data."""
+        api = self.api
         try:
-            await self.api.update()
+            if api.is_public_only:
+                await api.update_public()
+            else:
+                await api.update()
         except NotAuthorized as ex:
             if self._auth_failures < AUTH_RETRIES:
                 _LOGGER.exception("Auth error while updating")
@@ -381,16 +478,28 @@ class ProtectData:
     @callback
     def _async_process_updates(self) -> None:
         """Process update from the protect data."""
-        self._async_signal_device_update(self.api.bootstrap.nvr)
+        if self.api.is_public_only:
+            self._async_signal_public_nvr_update()
+        else:
+            self._async_signal_device_update(self.api.bootstrap.nvr)
         for device in self.get_by_types(DEVICES_THAT_ADOPT):
             self._async_signal_device_update(device)
         if self.api.has_public_bootstrap:
-            for relay in self.api.public_bootstrap.relays.values():
+            public_bootstrap = self.api.public_bootstrap
+            for relay in public_bootstrap.relays.values():
                 if subscriptions := self._relay_subscriptions.get(relay.mac):
                     for subscription_callback in subscriptions:
                         subscription_callback(relay)
-            for siren in self.api.public_bootstrap.sirens.values():
+            for siren in public_bootstrap.sirens.values():
                 self._async_signal_siren_update(siren)
+            for camera in public_bootstrap.cameras.values():
+                self._async_signal_public_camera_update(camera)
+            for public_device in chain(
+                public_bootstrap.sensors.values(),
+                public_bootstrap.lights.values(),
+                public_bootstrap.chimes.values(),
+            ):
+                self._async_signal_public_device_update(public_device)
 
     @callback
     def _async_poll(self, now: datetime) -> None:
@@ -435,6 +544,151 @@ class ProtectData:
         self._relay_subscriptions[mac].remove(update_callback)
         if not self._relay_subscriptions[mac]:
             del self._relay_subscriptions[mac]
+
+    @callback
+    def async_subscribe_public_device(
+        self, mac: str, update_callback: Callable[[ProtectModelWithId], None]
+    ) -> CALLBACK_TYPE:
+        """Add a callback subscriber for public-API device updates by mac."""
+        self._public_device_subscriptions[mac].add(update_callback)
+        return partial(self._async_unsubscribe_public_device, mac, update_callback)
+
+    @callback
+    def _async_unsubscribe_public_device(
+        self, mac: str, update_callback: Callable[[ProtectModelWithId], None]
+    ) -> None:
+        """Remove a public device callback subscriber."""
+        self._public_device_subscriptions[mac].remove(update_callback)
+        if not self._public_device_subscriptions[mac]:
+            del self._public_device_subscriptions[mac]
+
+    @callback
+    def _async_signal_public_device_update(self, device: ProtectModelWithId) -> None:
+        """Call the callbacks for a public device mac."""
+        if (mac := getattr(device, "mac", None)) is None:
+            return
+        if not (subscriptions := self._public_device_subscriptions.get(mac)):
+            return
+        _LOGGER.debug("Updating public device: %s", mac)
+        for update_callback in subscriptions:
+            update_callback(device)
+
+    @callback
+    def async_subscribe_public_motion(
+        self, camera_id: str, update_callback: Callable[[bool], None]
+    ) -> CALLBACK_TYPE:
+        """Add a callback subscriber for public events WS motion by camera id."""
+        self._public_motion_subscriptions[camera_id].add(update_callback)
+        return partial(
+            self._async_unsubscribe_public_motion, camera_id, update_callback
+        )
+
+    @callback
+    def _async_unsubscribe_public_motion(
+        self, camera_id: str, update_callback: Callable[[bool], None]
+    ) -> None:
+        """Remove a public motion callback subscriber."""
+        self._public_motion_subscriptions[camera_id].remove(update_callback)
+        if not self._public_motion_subscriptions[camera_id]:
+            del self._public_motion_subscriptions[camera_id]
+
+    @callback
+    def _async_process_public_events_ws_message(
+        self, message: WSSubscriptionMessage
+    ) -> None:
+        """Process a message from the public events websocket.
+
+        Motion-type events drive the motion binary sensors of public-only
+        camera entities: an event without an end time means motion is active.
+        """
+        event = message.new_obj
+        if event is None or event.model is not ModelType.EVENT:
+            _LOGGER.debug("Public event without event object: %s", message.changed_data)
+            return
+        if TYPE_CHECKING:
+            assert isinstance(event, Event)
+        # The public events payload identifies the camera in a "device" field,
+        # which the private Event model (built around the "camera" key) does
+        # not pick up — fall back to the raw payload.
+        camera_id = event.camera_id or message.changed_data.get("device")
+        _LOGGER.debug(
+            "Public event: type=%s camera_id=%s active=%s",
+            event.type,
+            camera_id,
+            event.end is None,
+        )
+        if not camera_id:
+            return
+        if event.type in _PUBLIC_MOTION_EVENT_TYPES and (
+            motion_subscriptions := self._public_motion_subscriptions.get(camera_id)
+        ):
+            is_on = event.end is None
+            _LOGGER.debug("Public motion event for %s: %s", camera_id, is_on)
+            for motion_callback in motion_subscriptions:
+                motion_callback(is_on)
+        if subscriptions := self._public_camera_event_subscriptions.get(camera_id):
+            for update_callback in subscriptions:
+                update_callback(event)
+
+    @callback
+    def async_subscribe_public_camera_events(
+        self, camera_id: str, update_callback: Callable[[Event], None]
+    ) -> CALLBACK_TYPE:
+        """Add a callback subscriber for public events WS events by camera id."""
+        self._public_camera_event_subscriptions[camera_id].add(update_callback)
+        return partial(
+            self._async_unsubscribe_public_camera_events, camera_id, update_callback
+        )
+
+    @callback
+    def _async_unsubscribe_public_camera_events(
+        self, camera_id: str, update_callback: Callable[[Event], None]
+    ) -> None:
+        """Remove a public camera events callback subscriber."""
+        self._public_camera_event_subscriptions[camera_id].remove(update_callback)
+        if not self._public_camera_event_subscriptions[camera_id]:
+            del self._public_camera_event_subscriptions[camera_id]
+
+    @callback
+    def async_subscribe_public_camera(
+        self, mac: str, update_callback: Callable[[PublicCamera], None]
+    ) -> CALLBACK_TYPE:
+        """Add a callback subscriber for public-API camera updates."""
+        self._public_camera_subscriptions[mac].add(update_callback)
+        return partial(self._async_unsubscribe_public_camera, mac, update_callback)
+
+    @callback
+    def _async_unsubscribe_public_camera(
+        self, mac: str, update_callback: Callable[[PublicCamera], None]
+    ) -> None:
+        """Remove a public camera callback subscriber."""
+        self._public_camera_subscriptions[mac].remove(update_callback)
+        if not self._public_camera_subscriptions[mac]:
+            del self._public_camera_subscriptions[mac]
+
+    @callback
+    def _async_signal_public_camera_update(self, camera: PublicCamera) -> None:
+        """Call the callbacks for a public camera mac."""
+        mac = camera.mac
+        if not (subscriptions := self._public_camera_subscriptions.get(mac)):
+            return
+        _LOGGER.debug("Updating public camera: %s (%s)", camera.name, mac)
+        for update_callback in subscriptions:
+            update_callback(camera)
+
+    @callback
+    def async_subscribe_public_nvr(
+        self, update_callback: Callable[[], None]
+    ) -> CALLBACK_TYPE:
+        """Add a callback subscriber for public-API NVR updates."""
+        self._public_nvr_subscriptions.add(update_callback)
+        return partial(self._public_nvr_subscriptions.discard, update_callback)
+
+    @callback
+    def _async_signal_public_nvr_update(self) -> None:
+        """Call the callbacks subscribed to public-API NVR updates."""
+        for update_callback in self._public_nvr_subscriptions:
+            update_callback()
 
     @callback
     def async_subscribe_siren(
@@ -513,7 +767,7 @@ def async_get_data_for_nvr_id(hass: HomeAssistant, nvr_id: str) -> ProtectData |
         iter(
             entry.runtime_data
             for entry in async_get_ufp_entries(hass)
-            if entry.runtime_data.api.bootstrap.nvr.id == nvr_id
+            if entry.runtime_data.nvr_id == nvr_id
         ),
         None,
     )

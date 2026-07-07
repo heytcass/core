@@ -4,7 +4,18 @@ from datetime import timedelta
 from unittest.mock import AsyncMock, Mock
 
 import pytest
-from uiprotect.data import Camera, Chime, Doorlock, IRLEDMode, Light, RingSetting
+from uiprotect.data import (
+    Camera,
+    Chime,
+    DeviceState,
+    Doorlock,
+    IRLEDMode,
+    Light,
+    ModelType,
+    PublicCamera,
+    PublicChime,
+    RingSetting,
+)
 
 from homeassistant.components.unifiprotect.const import DEFAULT_ATTRIBUTION
 from homeassistant.components.unifiprotect.number import (
@@ -434,3 +445,64 @@ async def test_chime_ring_volume_unavailable_when_unpaired(
     state = hass.states.get(entity_id)
     assert state
     assert state.state == "unavailable"
+
+
+async def test_public_only_chime_ring_volume(
+    hass: HomeAssistant,
+    entity_registry: er.EntityRegistry,
+    ufp_public: MockUFPFixture,
+) -> None:
+    """Test chime ring volume numbers on an API-key-only entry."""
+    camera = Mock(spec=PublicCamera)
+    camera.id = "test_public_camera_id"
+    camera.mac = "AABBCCDDEEFF"
+    camera.name = "Front Door"
+    camera.model = ModelType.CAMERA
+    camera.state = DeviceState.CONNECTED
+    camera.rtsps_streams = None
+    camera.feature_flags = Mock(smart_detect_types=[])
+    camera.lcd_message = None
+
+    chime = Mock(spec=PublicChime)
+    chime.id = "test_public_chime_id"
+    chime.mac = "CHIME0000001"
+    chime.name = "Hallway Chime"
+    chime.model = ModelType.CHIME
+    chime.state = DeviceState.CONNECTED
+    ring_setting = Mock(
+        camera_id=camera.id, volume=60, repeat_times=2, ringtone_id=None
+    )
+    chime.ring_settings = [ring_setting]
+
+    ufp_public.api.public_bootstrap.cameras = {camera.id: camera}
+    ufp_public.api.public_bootstrap.chimes = {chime.id: chime}
+    ufp_public.api.update_chime_public = AsyncMock()
+
+    await hass.config_entries.async_setup(ufp_public.entry.entry_id)
+    await hass.async_block_till_done()
+
+    entity_id = "number.hallway_chime_ring_volume_front_door"
+    entity = entity_registry.async_get(entity_id)
+    assert entity is not None
+    assert entity.unique_id == "CHIME0000001_ring_volume_test_public_camera_id"
+
+    state = hass.states.get(entity_id)
+    assert state is not None
+    assert state.state == "60"
+
+    await hass.services.async_call(
+        "number",
+        "set_value",
+        {ATTR_ENTITY_ID: entity_id, "value": 80},
+        blocking=True,
+    )
+    ufp_public.api.update_chime_public.assert_called_once_with(
+        "test_public_chime_id",
+        ring_settings=[
+            {
+                "cameraId": "test_public_camera_id",
+                "repeatTimes": 2,
+                "volume": 80,
+            }
+        ],
+    )

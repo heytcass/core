@@ -8,6 +8,7 @@
       "wrong_nvr": "Connected to a different NVR than expected. If you replaced your hardware, please remove the old integration and add it again."
     },
     "error": {
+      "auth_method_required": "Provide a username and password, or an API key (or both).",
       "cannot_connect": "[%key:common::config_flow::error::cannot_connect%]",
       "cloud_user": "Ubiquiti Cloud users are not supported. Please use a local user instead.",
       "invalid_auth": "[%key:common::config_flow::error::invalid_auth%]",
@@ -30,7 +31,7 @@
           "username": "[%key:component::unifiprotect::config::step::user::data_description::username%]",
           "verify_ssl": "[%key:component::unifiprotect::config::step::user::data_description::verify_ssl%]"
         },
-        "description": "Do you want to set up {name} ({ip_address})? You will need a local user created in your UniFi OS Console to log in with. Ubiquiti Cloud users will not work. For more information: {local_user_documentation_url}",
+        "description": "Do you want to set up {name} ({ip_address})? Log in with a local user created in your UniFi OS Console, an API key, or both. Ubiquiti Cloud users will not work. On consoles managed through UniFi Fabric with centralized people management, local users are not available and only an API key can be used. For more information: {local_user_documentation_url}",
         "title": "UniFi Protect discovered"
       },
       "reauth_confirm": {
@@ -77,14 +78,14 @@
           "verify_ssl": "[%key:common::config_flow::data::verify_ssl%]"
         },
         "data_description": {
-          "api_key": "API key for your local user account.",
+          "api_key": "API key created in your UniFi OS Console. Required if no username and password are provided.",
           "host": "Hostname or IP address of your UniFi Protect device.",
-          "password": "Password for your local user account.",
+          "password": "Password for your local user account. Can be left empty when an API key is provided.",
           "port": "Port of your UniFi Protect device.",
-          "username": "Username for your local (not cloud) user account.",
+          "username": "Username for your local (not cloud) user account. Can be left empty when an API key is provided.",
           "verify_ssl": "Verify SSL certificate of the UniFi Protect device."
         },
-        "description": "You will need a local user created in your UniFi OS Console to log in with. Ubiquiti Cloud users will not work. For more information: {local_user_documentation_url}",
+        "description": "Log in with a local user created in your UniFi OS Console, an API key, or both. Ubiquiti Cloud users will not work. On consoles managed through UniFi Fabric with centralized people management, local users are not available and only an API key can be used; functionality is then limited to what the UniFi Protect public API provides. For more information: {local_user_documentation_url}",
         "title": "UniFi Protect setup"
       }
     }
@@ -670,8 +671,14 @@
     }
   },
   "exceptions": {
+    "api_key_only_not_supported": {
+      "message": "This action requires local user credentials and is not available for consoles set up with an API key only."
+    },
     "api_key_required": {
       "message": "API key is required. Please reauthenticate this integration to provide an API key."
+    },
+    "chime_not_available": {
+      "message": "Chime is not available."
     },
     "command_error": {
       "message": "Error communicating with UniFi Protect while sending command: {error}"

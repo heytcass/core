@@ -3,7 +3,7 @@
 from unittest.mock import AsyncMock, Mock
 
 import pytest
-from uiprotect.data import NVR, NvrArmMode, NvrArmModeStatus, PublicBootstrap
+from uiprotect.data import NVR, ModelType, NvrArmMode, NvrArmModeStatus, PublicBootstrap
 from uiprotect.exceptions import GlobalAlarmManagerError
 from uiprotect.websocket import WebsocketState
 
@@ -27,6 +27,7 @@ from homeassistant.helpers import entity_registry as er
 from .utils import MockUFPFixture, assert_entity_counts, init_entry
 
 ALARM_ENTITY_ID = "alarm_control_panel.unifiprotect_alarm_manager"
+PUBLIC_ALARM_ENTITY_ID = "alarm_control_panel.test_nvr_alarm_manager"
 
 
 def _make_arm_mode(status: NvrArmModeStatus) -> Mock:
@@ -43,6 +44,10 @@ def _make_public_bootstrap(arm_mode: Mock | None) -> Mock:
     pb.arm_profiles = {}
     pb.relays = {}
     pb.sirens = {}
+    pb.cameras = {}
+    pb.sensors = {}
+    pb.lights = {}
+    pb.chimes = {}
     return pb
 
 
@@ -122,6 +127,64 @@ async def test_alarm_panel_not_created_without_arm_mode(
 
     await init_entry(hass, ufp, [])
     assert_entity_counts(hass, Platform.ALARM_CONTROL_PANEL, 0, 0)
+
+
+async def test_alarm_panel_public_only(
+    hass: HomeAssistant,
+    entity_registry: er.EntityRegistry,
+    ufp_public: MockUFPFixture,
+) -> None:
+    """Test the alarm panel on an API-key-only (public-only) entry."""
+    ufp_public.api.public_bootstrap.arm_mode = _make_arm_mode(NvrArmModeStatus.DISABLED)
+    ufp_public.api.enable_arm_alarm_public = AsyncMock()
+
+    await hass.config_entries.async_setup(ufp_public.entry.entry_id)
+    await hass.async_block_till_done()
+    assert_entity_counts(hass, Platform.ALARM_CONTROL_PANEL, 1, 1)
+
+    entity = entity_registry.async_get(PUBLIC_ALARM_ENTITY_ID)
+    assert entity is not None
+    assert entity.unique_id == "test_nvr_id_alarm"
+
+    state = hass.states.get(PUBLIC_ALARM_ENTITY_ID)
+    assert state is not None
+    assert state.state == AlarmControlPanelState.DISARMED
+
+    await hass.services.async_call(
+        ALARM_DOMAIN,
+        SERVICE_ALARM_ARM_AWAY,
+        {ATTR_ENTITY_ID: PUBLIC_ALARM_ENTITY_ID},
+        blocking=True,
+    )
+    ufp_public.api.enable_arm_alarm_public.assert_called_once()
+
+
+async def test_alarm_panel_public_only_state_update_via_ws(
+    hass: HomeAssistant,
+    ufp_public: MockUFPFixture,
+) -> None:
+    """Test public devices WS NVR updates refresh the public-only panel."""
+    ufp_public.api.public_bootstrap.arm_mode = _make_arm_mode(NvrArmModeStatus.DISABLED)
+
+    await hass.config_entries.async_setup(ufp_public.entry.entry_id)
+    await hass.async_block_till_done()
+
+    state = hass.states.get(PUBLIC_ALARM_ENTITY_ID)
+    assert state is not None
+    assert state.state == AlarmControlPanelState.DISARMED
+
+    ufp_public.api.public_bootstrap.arm_mode = _make_arm_mode(NvrArmModeStatus.ARMED)
+
+    mock_msg = Mock()
+    mock_msg.changed_data = {}
+    mock_msg.new_obj = Mock(model=ModelType.NVR)
+    assert ufp_public.devices_ws_subscription is not None
+    ufp_public.devices_ws_subscription(mock_msg)
+    await hass.async_block_till_done()
+
+    state = hass.states.get(PUBLIC_ALARM_ENTITY_ID)
+    assert state is not None
+    assert state.state == AlarmControlPanelState.ARMED_AWAY
 
 
 async def test_alarm_panel_disarm(

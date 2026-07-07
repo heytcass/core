@@ -116,6 +116,13 @@ def _async_get_ufp_instance(hass: HomeAssistant, device_id: str) -> ProtectApiCl
 
     config_entry_ids = device_entry.config_entries
     if ufp_instance := async_ufp_instance_for_config_entry_ids(hass, config_entry_ids):
+        # All actions operate on the private API, which is unavailable when
+        # the entry authenticates with an API key only.
+        if ufp_instance.is_public_only:
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="api_key_only_not_supported",
+            )
         return ufp_instance
 
     raise HomeAssistantError(

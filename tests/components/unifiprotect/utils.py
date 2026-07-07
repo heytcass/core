@@ -37,6 +37,7 @@ class MockUFPFixture:
     ws_subscription: Callable[[WSSubscriptionMessage], None] | None = None
     ws_state_subscription: Callable[[WebsocketState], None] | None = None
     devices_ws_subscription: Callable[[WSSubscriptionMessage], None] | None = None
+    events_ws_subscription: Callable[[WSSubscriptionMessage], None] | None = None
 
     def ws_msg(self, msg: WSSubscriptionMessage) -> None:
         """Emit WS message for testing."""

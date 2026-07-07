@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from functools import partial
 import logging
-from typing import Any
+from typing import TYPE_CHECKING, Any, cast
 
 from uiprotect.data import (
     NVR,
@@ -14,6 +14,7 @@ from uiprotect.data import (
     ModelType,
     ProtectAdoptableDeviceModel,
     ProtectDeviceModel,
+    PublicSensor,
     Sensor,
 )
 
@@ -46,6 +47,8 @@ from .entity import (
     ProtectEntityDescription,
     ProtectEventMixin,
     ProtectNVREntity,
+    ProtectPublicDeviceEntity,
+    PublicDeviceWithMac,
     T,
     async_all_device_entities,
 )
@@ -587,6 +590,86 @@ _MODEL_DESCRIPTIONS: dict[ModelType, Sequence[ProtectEntityDescription]] = {
 }
 
 
+@dataclass(frozen=True, kw_only=True)
+class ProtectPublicSensorEntityDescription(SensorEntityDescription):
+    """Describes a sensor backed by a public-API device."""
+
+    ufp_value_fn: Callable[[PublicDeviceWithMac], float | None]
+
+
+def _public_metric(device: PublicDeviceWithMac, metric: str) -> float | None:
+    """Read a metric value from a public sensor's stats."""
+    if TYPE_CHECKING:
+        assert isinstance(device, PublicSensor)
+    if (sensor_metric := getattr(device.stats, metric)) is None:
+        return None
+    return sensor_metric.value  # type: ignore[no-any-return]
+
+
+PUBLIC_SENSE_SENSORS: tuple[ProtectPublicSensorEntityDescription, ...] = (
+    ProtectPublicSensorEntityDescription(
+        key="temperature_level",
+        device_class=SensorDeviceClass.TEMPERATURE,
+        native_unit_of_measurement=UnitOfTemperature.CELSIUS,
+        state_class=SensorStateClass.MEASUREMENT,
+        ufp_value_fn=partial(_public_metric, metric="temperature"),
+    ),
+    ProtectPublicSensorEntityDescription(
+        key="humidity_level",
+        device_class=SensorDeviceClass.HUMIDITY,
+        native_unit_of_measurement=PERCENTAGE,
+        state_class=SensorStateClass.MEASUREMENT,
+        ufp_value_fn=partial(_public_metric, metric="humidity"),
+    ),
+    ProtectPublicSensorEntityDescription(
+        key="light_level",
+        device_class=SensorDeviceClass.ILLUMINANCE,
+        native_unit_of_measurement=LIGHT_LUX,
+        state_class=SensorStateClass.MEASUREMENT,
+        ufp_value_fn=partial(_public_metric, metric="light"),
+    ),
+    ProtectPublicSensorEntityDescription(
+        key="battery_level",
+        device_class=SensorDeviceClass.BATTERY,
+        native_unit_of_measurement=PERCENTAGE,
+        state_class=SensorStateClass.MEASUREMENT,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        ufp_value_fn=lambda device: (
+            cast(PublicSensor, device).battery_status.percentage
+        ),
+    ),
+)
+
+
+class ProtectPublicSensor(ProtectPublicDeviceEntity, SensorEntity):
+    """A public-API device sensor for API-key-only entries."""
+
+    entity_description: ProtectPublicSensorEntityDescription
+    _state_attrs = ("_attr_available", "_attr_native_value")
+
+    @callback
+    def _update_from_device(self, device: PublicDeviceWithMac) -> None:
+        super()._update_from_device(device)
+        self._attr_native_value = self.entity_description.ufp_value_fn(device)
+
+
+@callback
+def _async_setup_public_sensors(
+    data: ProtectData,
+    async_add_entities: AddConfigEntryEntitiesCallback,
+) -> None:
+    """Set up sensors from the public API for an API-key-only entry."""
+    api = data.api
+    if not api.has_public_bootstrap:
+        return
+    if entities := [
+        ProtectPublicSensor(data, device, description)
+        for device in api.public_bootstrap.sensors.values()
+        for description in PUBLIC_SENSE_SENSORS
+    ]:
+        async_add_entities(entities)
+
+
 async def async_setup_entry(
     hass: HomeAssistant,
     entry: UFPConfigEntry,
@@ -594,6 +677,10 @@ async def async_setup_entry(
 ) -> None:
     """Set up sensors for UniFi Protect integration."""
     data = entry.runtime_data
+
+    if data.api.is_public_only:
+        _async_setup_public_sensors(data, async_add_entities)
+        return
 
     @callback
     def _add_new_device(device: ProtectAdoptableDeviceModel) -> None:
@@ -649,6 +736,8 @@ def _async_event_entities(
 def _async_nvr_entities(
     data: ProtectData,
 ) -> list[BaseProtectEntity]:
+    if data.api.is_public_only:
+        return []
     entities: list[BaseProtectEntity] = []
     device = data.api.bootstrap.nvr
     for description in NVR_SENSORS + NVR_DISABLED_SENSORS:
